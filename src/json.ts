@@ -48,6 +48,24 @@ export function getValueType(value: JsonValue): JsonValueType {
   return typeof value as Exclude<JsonValueType, 'null' | 'array' | 'object'>
 }
 
+export function parentCardPath(path: JsonPath): JsonPath | null {
+  if (path.length === 0) return null
+  if (typeof path[path.length - 1] === 'number') {
+    return path.length <= 1 ? [] : path.slice(0, -2)
+  }
+  return path.slice(0, -1)
+}
+
+export function pathCardTitle(path: JsonPath): string {
+  if (path.length === 0) return '根节点'
+  const last = path[path.length - 1]
+  if (typeof last === 'number') {
+    const parentKey = path[path.length - 2]
+    return typeof parentKey === 'string' ? `${parentKey}[${last}]` : `[${last}]`
+  }
+  return last
+}
+
 export function pathToId(path: JsonPath): string {
   if (path.length === 0) return 'json-root'
   return `json-${path
@@ -57,6 +75,14 @@ export function pathToId(path: JsonPath): string {
         : `k-${encodeURIComponent(part).replaceAll('%', '_')}`,
     )
     .join('--')}`
+}
+
+export function copyKeyForPath(path: JsonPath, fallback = '$'): string {
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    const part = path[index]
+    if (typeof part === 'string') return part
+  }
+  return fallback
 }
 
 export function formatPath(path: JsonPath): string {

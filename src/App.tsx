@@ -5,8 +5,10 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent,
 } from 'react'
+import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { json } from '@codemirror/lang-json'
@@ -20,35 +22,93 @@ import {
   ChevronsRight,
   CircleAlert,
   Clipboard,
+  Copy,
   Download,
+  KeyRound,
   Maximize2,
   Minimize2,
   Moon,
   PanelLeftClose,
   Plus,
-  Search,
   Sparkles,
   Sun,
   Upload,
-  X,
 } from 'lucide-react'
 import { Diagram, type FocusRequest } from './Diagram'
 import { buildGraph, type GraphActions } from './graph'
 import { findJsonPathAtOffset, locateJsonPath } from './jsonSource'
 import {
   SAMPLE_JSON,
+  copyKeyForPath,
+  getAtPath,
   getJsonError,
   getJsonStats,
+  getValueType,
   isContainer,
   pathToId,
   updateAtPath,
   type JsonPath,
   type JsonValue,
+  type JsonValueType,
 } from './json'
+
+interface EditorContextMenu {
+  copyKey: string
+  copyValue: string
+  keyLabel: string
+  type: JsonValueType
+  x: number
+  y: number
+}
+
+function formatCopyValue(value: JsonValue): string {
+  if (typeof value === 'string') return value
+  if (isContainer(value)) return JSON.stringify(value, null, 2)
+  return value === null ? 'null' : String(value)
+}
+
+function cardPathForSelection(value: JsonValue, path: JsonPath): JsonPath {
+  let cardPath: JsonPath = []
+  let cursor: JsonValue = value
+
+  for (const [index, key] of path.entries()) {
+    if (!isContainer(cursor)) return cardPath
+
+    const child = Array.isArray(cursor)
+      ? typeof key === 'number'
+        ? cursor[key]
+        : undefined
+      : typeof key === 'string'
+        ? cursor[key]
+        : undefined
+    if (child === undefined) return cardPath
+
+    if (isContainer(child)) {
+      const empty = Array.isArray(child)
+        ? child.length === 0
+        : Object.keys(child).length === 0
+      const flattenedArray =
+        Array.isArray(child) &&
+        child.length > 0 &&
+        child.every((item) => isContainer(item))
+      if (!empty && !flattenedArray) {
+        cardPath = path.slice(0, index + 1)
+      }
+    }
+
+    cursor = child
+  }
+
+  return cardPath
+}
 
 const STORAGE_KEY = 'json-canvas-document-v1'
 const WORKSPACE_STORAGE_KEY = 'json-canvas-workspace-v2'
 const THEME_KEY = 'json-canvas-theme'
+const EDITOR_FONT_KEY = 'json-canvas-editor-font'
+const EDITOR_FONT_DEFAULT = 11
+const EDITOR_FONT_MIN = 10
+const EDITOR_FONT_MAX = 18
 
 interface StoredDocument {
   name: string
@@ -226,6 +286,19 @@ function loadInitialWorkspace(): InitialWorkspace {
   }
 }
 
+function clampEditorFontSize(size: number): number {
+  return Math.min(
+    EDITOR_FONT_MAX,
+    Math.max(EDITOR_FONT_MIN, Math.round(size)),
+  )
+}
+
+function loadInitialEditorFontSize(): number {
+  const stored = Number(window.localStorage.getItem(EDITOR_FONT_KEY))
+  if (!Number.isFinite(stored)) return EDITOR_FONT_DEFAULT
+  return clampEditorFontSize(stored)
+}
+
 function loadInitialTheme(): boolean {
   const stored = window.localStorage.getItem(THEME_KEY)
   if (stored) return stored === 'dark'
@@ -267,17 +340,22 @@ export default function App() {
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set())
   const [hiddenBranchIds, setHiddenBranchIds] = useState<Set<string>>(new Set())
   const [searchTerm, setSearchTerm] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchIndex, setSearchIndex] = useState(0)
   const [selectedPath, setSelectedPath] = useState<JsonPath | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null)
   const [preserveViewportRequest, setPreserveViewportRequest] = useState(0)
   const [dark, setDark] = useState(loadInitialTheme)
+  const [editorFontSize, setEditorFontSize] = useState(loadInitialEditorFontSize)
   const [editorVisible, setEditorVisible] = useState(true)
   const [sourcePanelWidth, setSourcePanelWidth] = useState<number | null>(null)
   const [resizingSource, setResizingSource] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const [editorContextMenu, setEditorContextMenu] =
+    useState<EditorContextMenu | null>(null)
   const valueRef = useRef(jsonValue)
   const documentsRef = useRef(initialWorkspace.documents)
   const editorViewRef = useRef<EditorView | null>(null)
@@ -293,6 +371,12 @@ export default function App() {
   const resizePointerRef = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const toastTimerRef = useRef<number | null>(null)
+  const dragDepthRef = useRef(0)
+  const warnOnLeaveRef = useRef(false)
+
+  const markWorkspaceEdited = useCallback(() => {
+    warnOnLeaveRef.current = true
+  }, [])
 
   const showToast = useCallback((message: string) => {
     setToast(message)
@@ -417,6 +501,59 @@ export default function App() {
     window.localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light')
   }, [dark])
 
+  const changeEditorFontSize = useCallback(
+    (nextSize: number | ((current: number) => number)) => {
+      setEditorFontSize((current) =>
+        clampEditorFontSize(
+          typeof nextSize === 'function' ? nextSize(current) : nextSize,
+        ),
+      )
+    },
+    [],
+  )
+
+  useEffect(() => {
+    window.localStorage.setItem(EDITOR_FONT_KEY, String(editorFontSize))
+    editorViewRef.current?.requestMeasure()
+  }, [editorFontSize])
+
+  useEffect(() => {
+    const panel = sourcePanelRef.current
+    if (!panel) return
+
+    const onWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return
+      event.preventDefault()
+      changeEditorFontSize((current) => current + (event.deltaY < 0 ? 1 : -1))
+    }
+
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return
+      if (!panel.contains(document.activeElement)) return
+      if (event.key === '=' || event.key === '+') {
+        event.preventDefault()
+        changeEditorFontSize((current) => current + 1)
+        return
+      }
+      if (event.key === '-' || event.key === '_') {
+        event.preventDefault()
+        changeEditorFontSize((current) => current - 1)
+        return
+      }
+      if (event.key === '0') {
+        event.preventDefault()
+        changeEditorFontSize(EDITOR_FONT_DEFAULT)
+      }
+    }
+
+    panel.addEventListener('wheel', onWheel, { passive: false })
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      panel.removeEventListener('wheel', onWheel)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [changeEditorFontSize, editorVisible])
+
   useEffect(() => {
     document.title = 'JSON Canvas'
     setDocuments((current) => {
@@ -467,6 +604,17 @@ export default function App() {
   }, [activeDocumentId, documents])
 
   useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!warnOnLeaveRef.current) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+
+  useEffect(() => {
     const view = editorViewRef.current
     if (
       !view ||
@@ -512,6 +660,7 @@ export default function App() {
   }, [dispatchEditorSelection])
 
   const handleSourceChange = useCallback((nextSource: string) => {
+    markWorkspaceEdited()
     const compactedSource = compactJsonIndentation(nextSource)
     selectionOriginRef.current = null
     setSelectedPath(null)
@@ -534,7 +683,7 @@ export default function App() {
     } catch (error) {
       setParseError(getJsonError(error))
     }
-  }, [])
+  }, [markWorkspaceEdited])
 
   const activateDocument = useCallback((document: JsonViewDocument) => {
     const compactedSource = compactJsonIndentation(document.source)
@@ -542,6 +691,8 @@ export default function App() {
     setDocumentName(document.name)
     setSource(compactedSource)
     setSearchTerm('')
+    setSearchOpen(false)
+    setSearchIndex(0)
     setCollapsedIds(new Set())
     setHiddenBranchIds(new Set())
     setSelectedPath(null)
@@ -597,6 +748,24 @@ export default function App() {
   )
 
   const handleFocus = useCallback((path: JsonPath) => {
+    selectionOriginRef.current = 'graph'
+    setHiddenBranchIds((current) => {
+      const next = new Set(current)
+      for (let index = 1; index <= path.length; index += 1) {
+        next.delete(pathToId(path.slice(0, index)))
+      }
+      return next
+    })
+    setCollapsedIds((current) => {
+      const next = new Set(current)
+      for (let index = 0; index <= path.length; index += 1) {
+        next.delete(pathToId(path.slice(0, index)))
+      }
+      return next
+    })
+    setSelectedEdgeId(null)
+    setSelectedPath(path)
+    setSelectedNodeId(pathToId(path))
     setFocusRequest({
       id: pathToId(path),
       nonce: Date.now(),
@@ -646,6 +815,26 @@ export default function App() {
     [],
   )
 
+  useEffect(() => {
+    if (!editorContextMenu) return
+
+    const closeMenu = () => setEditorContextMenu(null)
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu()
+    }
+
+    window.addEventListener('blur', closeMenu)
+    window.addEventListener('pointerdown', closeMenu)
+    window.addEventListener('keydown', closeOnEscape)
+    window.addEventListener('resize', closeMenu)
+    return () => {
+      window.removeEventListener('blur', closeMenu)
+      window.removeEventListener('pointerdown', closeMenu)
+      window.removeEventListener('keydown', closeOnEscape)
+      window.removeEventListener('resize', closeMenu)
+    }
+  }, [editorContextMenu])
+
   const handleCopyGraphItem = useCallback(
     (text: string, kind: 'key' | 'value') => {
       void (async () => {
@@ -660,8 +849,74 @@ export default function App() {
     [showToast],
   )
 
+  const handleEditorContextMenu = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>) => {
+      const view = editorViewRef.current
+      if (!view || parseError) return
+
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY })
+      let offset = pos ?? view.state.selection.main.head
+      const line = view.state.doc.lineAt(offset)
+      const firstContentIndex = line.text.search(/\S/)
+      if (firstContentIndex >= 0 && offset <= line.from + firstContentIndex) {
+        offset = line.from + firstContentIndex
+      }
+
+      const location =
+        findJsonPathAtOffset(view.state.doc.toString(), offset) ??
+        (selectedPath
+          ? { path: selectedPath, from: 0, to: 0, isContainer: false }
+          : null)
+      if (!location) {
+        event.preventDefault()
+        showToast('请先选中一个字段')
+        return
+      }
+
+      event.preventDefault()
+
+      let value: JsonValue
+      try {
+        value = getAtPath(jsonValue, location.path)
+      } catch {
+        showToast('无法读取该字段')
+        return
+      }
+
+      const keyLabel = copyKeyForPath(location.path, documentName || '$')
+      const cardPath = cardPathForSelection(jsonValue, location.path)
+
+      selectionOriginRef.current = 'editor'
+      setSelectedEdgeId(null)
+      setSelectedPath(location.path)
+      setSelectedNodeId(pathToId(cardPath))
+      setEditorContextMenu({
+        copyKey: keyLabel,
+        copyValue: formatCopyValue(value),
+        keyLabel,
+        type: getValueType(value),
+        x: Math.max(8, Math.min(event.clientX, window.innerWidth - 176)),
+        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 120)),
+      })
+    },
+    [documentName, jsonValue, parseError, selectedPath, showToast],
+  )
+
+  const copyEditorContextItem = useCallback(
+    (kind: 'key' | 'value') => {
+      if (!editorContextMenu) return
+      handleCopyGraphItem(
+        kind === 'key' ? editorContextMenu.copyKey : editorContextMenu.copyValue,
+        kind,
+      )
+      setEditorContextMenu(null)
+    },
+    [editorContextMenu, handleCopyGraphItem],
+  )
+
   const handleEditGraphValue = useCallback(
     (path: JsonPath, nextValue: JsonValue) => {
+      markWorkspaceEdited()
       const nextJsonValue = updateAtPath(valueRef.current, path, () => nextValue)
       valueRef.current = nextJsonValue
       selectionOriginRef.current = null
@@ -671,7 +926,7 @@ export default function App() {
       setPreserveViewportRequest((current) => current + 1)
       showToast('Value 已更新')
     },
-    [showToast],
+    [markWorkspaceEdited, showToast],
   )
 
   const graphActions = useMemo<GraphActions>(
@@ -730,33 +985,33 @@ export default function App() {
         HighlightStyle.define([
           {
             tag: tags.propertyName,
-            color: dark ? '#7cc7f0' : '#287b9b',
+            color: dark ? '#7dcfff' : '#287b9b',
             fontWeight: '600',
           },
           {
             tag: tags.string,
-            color: dark ? '#f0a273' : '#aa3f49',
+            color: dark ? '#e0af68' : '#aa3f49',
           },
           {
             tag: tags.number,
-            color: dark ? '#73d6a2' : '#16845b',
+            color: dark ? '#9ece6a' : '#16845b',
           },
           {
             tag: tags.bool,
-            color: dark ? '#c6a1f0' : '#7257f6',
+            color: dark ? '#bb9af7' : '#7257f6',
           },
           {
             tag: tags.null,
-            color: dark ? '#aeb5c4' : '#858b98',
+            color: dark ? '#7a849e' : '#858b98',
             fontStyle: 'italic',
           },
           {
             tag: [tags.punctuation, tags.separator, tags.brace],
-            color: dark ? '#9199aa' : '#656c79',
+            color: dark ? '#6d768a' : '#656c79',
           },
           {
             tag: tags.escape,
-            color: dark ? '#f1cf78' : '#a87413',
+            color: dark ? '#e8c07a' : '#a87413',
           },
           {
             tag: tags.invalid,
@@ -802,55 +1057,104 @@ export default function App() {
       }
 
       let offset = selection.empty ? selection.head : selection.from
-      if (selection.empty) {
-        const line = update.state.doc.lineAt(selection.head)
-        const firstContentIndex = line.text.search(/\S/)
-        const firstContentOffset =
-          firstContentIndex < 0 ? line.from : line.from + firstContentIndex
-        if (offset <= firstContentOffset) offset = firstContentOffset
+      const line = update.state.doc.lineAt(offset)
+      const firstContentIndex = line.text.search(/\S/)
+      if (firstContentIndex >= 0 && offset <= line.from + firstContentIndex) {
+        offset = line.from + firstContentIndex
       }
 
       const sourceText = update.state.doc.toString()
       const location = findJsonPathAtOffset(sourceText, offset)
       if (!location) return
 
-      const nodeIds = new Set(graph.nodes.map((node) => node.id))
-      const nodePath = [...location.path]
-      while (
-        nodePath.length > 0 &&
-        !nodeIds.has(pathToId(nodePath))
-      ) {
-        nodePath.pop()
-      }
+      const cardPath = cardPathForSelection(jsonValue, location.path)
+      const nodeId = pathToId(cardPath)
 
-      const nodeId = pathToId(nodePath)
-      if (!nodeIds.has(nodeId)) return
+      setHiddenBranchIds((current) => {
+        const next = new Set(current)
+        for (let index = 1; index <= location.path.length; index += 1) {
+          next.delete(pathToId(location.path.slice(0, index)))
+        }
+        return next
+      })
+      setCollapsedIds((current) => {
+        const next = new Set(current)
+        for (let index = 0; index <= cardPath.length; index += 1) {
+          next.delete(pathToId(cardPath.slice(0, index)))
+        }
+        return next
+      })
 
       selectionOriginRef.current = 'editor'
       setSelectedEdgeId(null)
       setSelectedPath(location.path)
       setSelectedNodeId(nodeId)
-      setFocusRequest({ id: nodeId, nonce: Date.now() })
+      setFocusRequest({
+        id: nodeId,
+        nonce: Date.now(),
+        path: location.path,
+      })
     },
-    [graph.nodes],
+    [jsonValue],
   )
 
-  const focusFirstMatch = () => {
-    const node = graph.nodes.find((candidate) => candidate.data.matched)
-    if (!node) return
-    setFocusRequest({ id: node.id, nonce: Date.now() })
-  }
+  const activateSearchMatch = useCallback(
+    (index: number) => {
+      const matches = graph.matches
+      if (matches.length === 0) {
+        setSearchIndex(0)
+        return
+      }
+      const next = ((index % matches.length) + matches.length) % matches.length
+      const match = matches[next]
+      setSearchIndex(next)
+      selectionOriginRef.current = 'graph'
+      setSelectedEdgeId(null)
+      setSelectedPath(match.path)
+      setSelectedNodeId(match.nodeId)
+      setFocusRequest({
+        id: match.nodeId,
+        nonce: Date.now(),
+        path: match.path,
+      })
+    },
+    [graph.matches],
+  )
+
+  useEffect(() => {
+    if (!searchOpen || !searchTerm.trim()) {
+      setSearchIndex(0)
+      return
+    }
+    const match = graph.matches[0]
+    if (!match) {
+      setSearchIndex(0)
+      return
+    }
+    setSearchIndex(0)
+    selectionOriginRef.current = 'graph'
+    setSelectedEdgeId(null)
+    setSelectedPath(match.path)
+    setSelectedNodeId(match.nodeId)
+    setFocusRequest({
+      id: match.nodeId,
+      nonce: Date.now(),
+      path: match.path,
+    })
+  }, [searchOpen, searchTerm])
 
   const formatSource = () => {
     if (parseError) {
       showToast('请先修复 JSON 语法错误')
       return
     }
+    markWorkspaceEdited()
     setSource(JSON.stringify(jsonValue, null, 2))
     showToast('已格式化')
   }
 
   const createDocument = useCallback(() => {
+    markWorkspaceEdited()
     const currentDocuments = snapshotActiveDocument()
     const existingNames = new Set(
       currentDocuments.map((document) => document.name),
@@ -868,7 +1172,7 @@ export default function App() {
     setDocuments(nextDocuments)
     setActiveDocumentId(nextDocument.id)
     activateDocument(nextDocument)
-  }, [activateDocument, snapshotActiveDocument])
+  }, [activateDocument, markWorkspaceEdited, snapshotActiveDocument])
 
   const loadFile = useCallback(
     async (file: File) => {
@@ -884,6 +1188,66 @@ export default function App() {
     },
     [handleSourceChange, showToast],
   )
+
+  const clearDragActive = useCallback(() => {
+    dragDepthRef.current = 0
+    setDragActive(false)
+  }, [])
+
+  useEffect(() => {
+    const isFileDrag = (event: DragEvent) =>
+      Array.from(event.dataTransfer?.types ?? []).includes('Files')
+
+    const onDragEnter = (event: DragEvent) => {
+      if (!isFileDrag(event)) return
+      event.preventDefault()
+      dragDepthRef.current += 1
+      setDragActive(true)
+    }
+
+    const onDragOver = (event: DragEvent) => {
+      if (!isFileDrag(event)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    }
+
+    const onDragLeave = (event: DragEvent) => {
+      if (!isFileDrag(event)) return
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+      if (dragDepthRef.current === 0 || event.relatedTarget === null) {
+        clearDragActive()
+      }
+    }
+
+    const onDrop = (event: DragEvent) => {
+      const file = isFileDrag(event) ? event.dataTransfer?.files[0] : undefined
+      event.preventDefault()
+      clearDragActive()
+      if (file) void loadFile(file)
+    }
+
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') clearDragActive()
+    }
+
+    window.addEventListener('dragenter', onDragEnter)
+    window.addEventListener('dragover', onDragOver)
+    window.addEventListener('dragleave', onDragLeave)
+    window.addEventListener('drop', onDrop)
+    window.addEventListener('dragend', clearDragActive)
+    window.addEventListener('blur', clearDragActive)
+    window.addEventListener('keydown', onKeyDown)
+
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter)
+      window.removeEventListener('dragover', onDragOver)
+      window.removeEventListener('dragleave', onDragLeave)
+      window.removeEventListener('drop', onDrop)
+      window.removeEventListener('dragend', clearDragActive)
+      window.removeEventListener('blur', clearDragActive)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [clearDragActive, loadFile])
 
   const downloadFile = () => {
     if (parseError) {
@@ -911,23 +1275,7 @@ export default function App() {
   }
 
   return (
-    <div
-      className={`app-shell ${dragActive ? 'is-dragging' : ''}`}
-      onDragEnter={(event) => {
-        event.preventDefault()
-        setDragActive(true)
-      }}
-      onDragLeave={(event) => {
-        if (event.currentTarget === event.target) setDragActive(false)
-      }}
-      onDragOver={(event) => event.preventDefault()}
-      onDrop={(event) => {
-        event.preventDefault()
-        setDragActive(false)
-        const file = event.dataTransfer.files[0]
-        if (file) void loadFile(file)
-      }}
-    >
+    <div className={`app-shell ${dragActive ? 'is-dragging' : ''}`}>
       <header className="app-header">
         <div className="brand">
           <span className="brand-mark">
@@ -967,7 +1315,10 @@ export default function App() {
                   <input
                     aria-label="文档名称"
                     className="document-name"
-                    onChange={(event) => setDocumentName(event.target.value)}
+                    onChange={(event) => {
+                      markWorkspaceEdited()
+                      setDocumentName(event.target.value)
+                    }}
                     spellCheck={false}
                     value={documentName}
                   />
@@ -1003,9 +1354,6 @@ export default function App() {
             type="button"
           >
             <Upload size={17} />
-          </button>
-          <button className="toolbar-button" onClick={copySource} title="复制" type="button">
-            <Clipboard size={17} />
           </button>
           <button className="toolbar-button" onClick={downloadFile} title="下载" type="button">
             <Download size={17} />
@@ -1055,6 +1403,44 @@ export default function App() {
                 <small>{formatBytes(sourceBytes)}</small>
               </div>
               <div className="panel-actions">
+                <div
+                  className="font-size-control"
+                  title="编辑器字号，Ctrl + 滚轮也可调节"
+                >
+                  <button
+                    aria-label="缩小字号"
+                    disabled={editorFontSize <= EDITOR_FONT_MIN}
+                    onClick={() => changeEditorFontSize(editorFontSize - 1)}
+                    type="button"
+                  >
+                    A−
+                  </button>
+                  <button
+                    aria-label="重置字号"
+                    className="font-size-value"
+                    onClick={() => changeEditorFontSize(EDITOR_FONT_DEFAULT)}
+                    type="button"
+                  >
+                    {editorFontSize}
+                  </button>
+                  <button
+                    aria-label="放大字号"
+                    disabled={editorFontSize >= EDITOR_FONT_MAX}
+                    onClick={() => changeEditorFontSize(editorFontSize + 1)}
+                    type="button"
+                  >
+                    A+
+                  </button>
+                </div>
+                <button
+                  className="panel-button"
+                  onClick={() => void copySource()}
+                  title="复制 JSON"
+                  type="button"
+                >
+                  <Clipboard size={14} />
+                  复制
+                </button>
                 <button
                   className="panel-button"
                   disabled={Boolean(parseError)}
@@ -1076,14 +1462,18 @@ export default function App() {
               </div>
             </div>
 
-            <div className="code-editor">
+            <div
+              className="code-editor"
+              onContextMenu={handleEditorContextMenu}
+              style={{ ['--editor-font-size' as string]: `${editorFontSize}px` }}
+            >
               <CodeMirror
                 basicSetup={{
                   bracketMatching: true,
                   closeBrackets: true,
                   foldGutter: true,
                   highlightActiveLine: true,
-                  highlightSelectionMatches: true,
+                  highlightSelectionMatches: false,
                   lineNumbers: true,
                 }}
                 extensions={jsonExtension}
@@ -1142,30 +1532,6 @@ export default function App() {
             </div>
 
             <div className="graph-tools">
-              <label className="search-box">
-                <Search size={14} />
-                <input
-                  aria-label="搜索键、值或路径"
-                  onChange={(event) => setSearchTerm(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') focusFirstMatch()
-                  }}
-                  placeholder="搜索键、值或路径"
-                  value={searchTerm}
-                />
-                {searchTerm && (
-                  <>
-                    <span className="match-count">{graph.matchCount}</span>
-                    <button
-                      aria-label="清除搜索"
-                      onClick={() => setSearchTerm('')}
-                      type="button"
-                    >
-                      <X size={13} />
-                    </button>
-                  </>
-                )}
-              </label>
               <button
                 className="icon-button"
                 onClick={() => {
@@ -1208,8 +1574,19 @@ export default function App() {
             definition={graph}
             focusRequest={focusRequest}
             onClearSelection={clearSelection}
+            onSearchChange={setSearchTerm}
+            onSearchClose={() => {
+              setSearchOpen(false)
+              setSearchTerm('')
+              setSearchIndex(0)
+            }}
+            onSearchIndexChange={activateSearchMatch}
+            onSearchOpen={() => setSearchOpen(true)}
             onSelectEdge={handleSelectEdge}
             preserveViewportRequest={preserveViewportRequest}
+            searchIndex={searchIndex}
+            searchOpen={searchOpen}
+            searchTerm={searchTerm}
             selectedEdgeId={selectedEdgeId}
             selectedNodeId={selectedNodeId}
             stale={Boolean(parseError)}
@@ -1218,9 +1595,10 @@ export default function App() {
       </main>
 
       {dragActive && (
-        <div className="drop-overlay">
+        <div className="drop-overlay" onClick={clearDragActive} role="presentation">
           <Upload size={28} />
           <strong>放开以载入 JSON 文件</strong>
+          <span>点击空白处或按 Esc 取消</span>
         </div>
       )}
 
@@ -1230,6 +1608,43 @@ export default function App() {
           {toast}
         </div>
       )}
+
+      {editorContextMenu &&
+        createPortal(
+          <div
+            aria-label="源码字段操作菜单"
+            className="json-row-context-menu source-context-menu"
+            onContextMenu={(event) => event.preventDefault()}
+            onPointerDown={(event) => event.stopPropagation()}
+            role="menu"
+            style={{ left: editorContextMenu.x, top: editorContextMenu.y }}
+          >
+            <div className="json-row-context-menu-meta">
+              <strong title={editorContextMenu.keyLabel}>
+                {editorContextMenu.keyLabel}
+              </strong>
+              <span>{editorContextMenu.type}</span>
+            </div>
+            <button
+              autoFocus
+              onClick={() => copyEditorContextItem('value')}
+              role="menuitem"
+              type="button"
+            >
+              <Copy size={13} />
+              <span>复制 Value</span>
+            </button>
+            <button
+              onClick={() => copyEditorContextItem('key')}
+              role="menuitem"
+              type="button"
+            >
+              <KeyRound size={13} />
+              <span>复制 Key</span>
+            </button>
+          </div>,
+          document.body,
+        )}
 
       <div className="mobile-panel-toggle">
         <button

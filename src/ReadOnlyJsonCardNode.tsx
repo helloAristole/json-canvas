@@ -1,30 +1,42 @@
 import {
   memo,
   useEffect,
+  useLayoutEffect,
+  useRef,
   useState,
+  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
 import {
   ChevronDown,
   ChevronRight,
   Copy,
+  CornerDownRight,
+  CornerLeftUp,
   KeyRound,
   Pencil,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import {
+  parentCardPath,
   pathToId,
   type JsonPath,
   type JsonPrimitive,
   type JsonValue,
   type JsonValueType,
 } from './json'
-import type { JsonFlowNode } from './graph'
+import type { ContainerRow, JsonFlowNode } from './graph'
+
+interface NavTarget {
+  label: string
+  path: JsonPath
+}
 
 interface RowContextMenu {
   copyKey: string
   copyValue: string
+  mode: 'card' | 'row'
   path: JsonPath
   type: JsonValueType
   x: number
@@ -44,6 +56,49 @@ interface ValueEditorState {
   keyLabel: string
   path: JsonPath
   type: JsonValueType
+}
+
+function measureDraftWidth(draft: string): number {
+  const longestLine = draft.split('\n').reduce((longest, line) => {
+    const units = Array.from(line).reduce(
+      (width, character) =>
+        width + (character.codePointAt(0)! > 0xff ? 2 : 1),
+      0,
+    )
+    return Math.max(longest, units)
+  }, 0)
+  return Math.ceil(longestLine * 7.4 + 28)
+}
+
+function childTargetsFromRows(rows: ContainerRow[]): NavTarget[] {
+  return rows.flatMap((row) => {
+    if (!row.linked) return []
+    const focusPath = row.focusPath ?? row.path
+    const flattened =
+      focusPath.length === row.path.length + 1 &&
+      typeof focusPath[focusPath.length - 1] === 'number'
+    if (flattened) {
+      return Array.from({ length: Math.max(0, row.size) }, (_, index) => ({
+        label: `${row.keyLabel}[${index}]`,
+        path: [...row.path, index] as JsonPath,
+      }))
+    }
+    return [{ label: row.keyLabel, path: row.path }]
+  })
+}
+
+function fitValueEditor(textarea: HTMLTextAreaElement) {
+  const minWidth = 360
+  const maxWidth = Math.min(860, window.innerWidth - 80)
+  const maxHeight = Math.min(window.innerHeight * 0.72, 720)
+  textarea.style.width = `${Math.max(
+    minWidth,
+    Math.min(maxWidth, measureDraftWidth(textarea.value)),
+  )}px`
+  textarea.style.height = 'auto'
+  const nextHeight = Math.min(Math.max(textarea.scrollHeight, 78), maxHeight)
+  textarea.style.height = `${nextHeight}px`
+  textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
 }
 
 function parseEditedValue(
@@ -66,6 +121,11 @@ function parseEditedValue(
   }
 }
 
+function previewPrimitive(value: JsonPrimitive): string {
+  if (value === null) return 'null'
+  return String(value)
+}
+
 function StaticKey({
   label,
   arrayItem = false,
@@ -84,15 +144,23 @@ function StaticKey({
 }
 
 function StaticValue({
+  multiline = false,
+  onDoubleClick,
   value,
 }: {
+  multiline?: boolean
+  onDoubleClick?: (event: ReactMouseEvent<HTMLSpanElement>) => void
   value: JsonPrimitive
 }) {
   const type = value === null ? 'null' : typeof value
   const text = value === null ? 'null' : String(value)
 
   return (
-    <span className={`json-value value-${type}`} title={text}>
+    <span
+      className={`json-value value-${type} ${multiline ? 'is-multiline' : ''}`}
+      onDoubleClick={onDoubleClick}
+      title={type === 'null' ? text : `${text}\n双击编辑`}
+    >
       {text}
     </span>
   )
@@ -113,6 +181,7 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
     hoveredSourcePathId,
     primitiveRows,
     containerRows,
+    onFocus,
     onSelect,
     onCopy,
     onEditValue,
@@ -121,37 +190,129 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
   } = data
   const canCollapse = kind === 'object' || kind === 'array'
   const isRoot = path.length === 0
+  const parentPath = parentCardPath(path)
+  const childTargets = childTargetsFromRows(containerRows)
+  const hasParent = parentPath !== null
+  const canGoto = childTargets.length > 0 || primitiveRows.length > 0
   const [contextMenu, setContextMenu] = useState<RowContextMenu | null>(null)
+  const [gotoOpen, setGotoOpen] = useState(false)
+  const [gotoMenuStyle, setGotoMenuStyle] = useState<CSSProperties>({
+    left: 0,
+    top: 0,
+  })
   const [valueEditor, setValueEditor] = useState<ValueEditorState | null>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const gotoTriggerRef = useRef<HTMLButtonElement>(null)
+  const gotoMenuRef = useRef<HTMLDivElement>(null)
+  const gotoCloseTimerRef = useRef<number | null>(null)
+  const valueEditorInputRef = useRef<HTMLTextAreaElement>(null)
+
+  const clearGotoCloseTimer = () => {
+    if (gotoCloseTimerRef.current !== null) {
+      window.clearTimeout(gotoCloseTimerRef.current)
+      gotoCloseTimerRef.current = null
+    }
+  }
+
+  const openGoto = () => {
+    clearGotoCloseTimer()
+    setGotoOpen(true)
+  }
+
+  const scheduleCloseGoto = () => {
+    clearGotoCloseTimer()
+    gotoCloseTimerRef.current = window.setTimeout(() => {
+      setGotoOpen(false)
+      gotoCloseTimerRef.current = null
+    }, 180)
+  }
 
   useEffect(() => {
     if (!contextMenu) return
 
-    const closeMenu = () => setContextMenu(null)
-    const closeOnEscape = (event: KeyboardEvent) => {
+    const closeMenu = () => {
+      clearGotoCloseTimer()
+      setContextMenu(null)
+      setGotoOpen(false)
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') closeMenu()
+    }
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (menuRef.current?.contains(target)) return
+      if (gotoMenuRef.current?.contains(target)) return
+      closeMenu()
     }
 
     window.addEventListener('blur', closeMenu)
-    window.addEventListener('pointerdown', closeMenu)
+    window.addEventListener('pointerdown', closeOnPointerDown)
     window.addEventListener('keydown', closeOnEscape)
     window.addEventListener('resize', closeMenu)
     return () => {
       window.removeEventListener('blur', closeMenu)
-      window.removeEventListener('pointerdown', closeMenu)
+      window.removeEventListener('pointerdown', closeOnPointerDown)
       window.removeEventListener('keydown', closeOnEscape)
       window.removeEventListener('resize', closeMenu)
     }
   }, [contextMenu])
 
+  useLayoutEffect(() => {
+    if (!gotoOpen || !gotoTriggerRef.current) return
+    const trigger = gotoTriggerRef.current.getBoundingClientRect()
+    const flyout = gotoMenuRef.current
+    const menuWidth = Math.max(flyout?.offsetWidth ?? 220, 196)
+    const menuHeight = flyout?.offsetHeight ?? 160
+    const maxHeight = Math.min(360, window.innerHeight - 16)
+    let left = trigger.right - 2
+    if (left + menuWidth > window.innerWidth - 8) {
+      left = Math.max(8, trigger.left - menuWidth + 2)
+    }
+    let top = trigger.top
+    if (top + Math.min(menuHeight, maxHeight) > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - Math.min(menuHeight, maxHeight) - 8)
+    }
+    setGotoMenuStyle({ left, top, maxHeight })
+  }, [childTargets.length, gotoOpen, primitiveRows.length])
+
+  useEffect(() => {
+    return () => {
+      if (gotoCloseTimerRef.current !== null) {
+        window.clearTimeout(gotoCloseTimerRef.current)
+      }
+    }
+  }, [])
+
   useEffect(() => {
     if (!valueEditor) return
-    const closeOnEscape = (event: KeyboardEvent) => {
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') setValueEditor(null)
     }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [valueEditor])
+
+  useLayoutEffect(() => {
+    const textarea = valueEditorInputRef.current
+    if (!valueEditor || !textarea) return
+    fitValueEditor(textarea)
+  }, [valueEditor])
+
+  useEffect(() => {
+    if (!valueEditor) return
+    const onResize = () => {
+      if (valueEditorInputRef.current) {
+        fitValueEditor(valueEditorInputRef.current)
+      }
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [valueEditor !== null])
+
+  const menuPosition = (event: ReactMouseEvent<HTMLElement>, height: number) => ({
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 280)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - height)),
+  })
 
   const openContextMenu = (
     event: ReactMouseEvent<HTMLElement>,
@@ -160,14 +321,43 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
     event.preventDefault()
     event.stopPropagation()
     onSelect(row.path, path)
+    setGotoOpen(false)
     setContextMenu({
       copyKey: row.copyKey,
       copyValue: row.copyValue,
+      mode: 'row',
       path: row.path,
       type: row.type,
-      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 156)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 116)),
+      ...menuPosition(event, hasParent ? 150 : 116),
     })
+  }
+
+  const openCardContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    onSelect(path, path)
+    setGotoOpen(false)
+    setContextMenu({
+      copyKey: title,
+      copyValue: '',
+      mode: 'card',
+      path,
+      type: kind,
+      ...menuPosition(event, hasParent && canGoto ? 160 : 120),
+    })
+  }
+
+  const focusParentNode = () => {
+    if (parentPath === null) return
+    onFocus(parentPath)
+    setContextMenu(null)
+    setGotoOpen(false)
+  }
+
+  const focusNavTarget = (targetPath: JsonPath) => {
+    onFocus(targetPath)
+    setContextMenu(null)
+    setGotoOpen(false)
   }
 
   const copyContextItem = (kind: 'key' | 'value') => {
@@ -177,18 +367,30 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
       kind,
     )
     setContextMenu(null)
+    setGotoOpen(false)
+  }
+
+  const openValueEditor = (row: CopyableRow) => {
+    if (row.type === 'null') return
+    setContextMenu(null)
+    setGotoOpen(false)
+    setValueEditor({
+      draft: row.copyValue,
+      error: null,
+      keyLabel: row.copyKey,
+      path: row.path,
+      type: row.type,
+    })
   }
 
   const editContextValue = () => {
-    if (!contextMenu || contextMenu.type === 'null') return
-    setValueEditor({
-      draft: contextMenu.copyValue,
-      error: null,
-      keyLabel: contextMenu.copyKey,
-      path: contextMenu.path,
-      type: contextMenu.type,
-    })
-    setContextMenu(null)
+    if (!contextMenu) return
+    openValueEditor(contextMenu)
+  }
+
+  const copyEditorDraft = () => {
+    if (!valueEditor) return
+    onCopy(valueEditor.draft, 'value')
   }
 
   const saveEditedValue = () => {
@@ -220,7 +422,10 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
         />
       )}
 
-      <header className="json-node-header">
+      <header
+        className="json-node-header"
+        onContextMenu={openCardContextMenu}
+      >
         <span className="node-heading">
           <strong title={title}>{title}</strong>
           <small title={pathLabel}>{pathLabel}</small>
@@ -248,7 +453,9 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
             <div
               className={`json-node-row nodrag nopan ${
                 row.matched ? 'row-match' : ''
-              } ${row.selected ? 'is-selected-row' : ''}`}
+              } ${row.selected ? 'is-selected-row' : ''} ${
+                row.multiline ? 'is-multiline' : ''
+              } ${row.keyLabel ? '' : 'is-leaf-text'}`}
               key={`${row.path.join('.')}-primitive`}
               onClick={(event) => {
                 event.stopPropagation()
@@ -267,16 +474,30 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
               }}
               role="button"
               style={{
-                gridTemplateColumns: `${keyColumnWidth}px minmax(0, 1fr)`,
+                gridTemplateColumns: row.keyLabel
+                  ? `${keyColumnWidth}px minmax(0, 1fr)`
+                  : 'minmax(0, 1fr)',
+                height: row.multiline ? undefined : row.height,
                 order: row.order,
               }}
               tabIndex={0}
             >
-              <StaticKey
-                arrayItem={row.isArrayItem || row.isRoot}
-                label={row.keyLabel}
+              {row.keyLabel ? (
+                <StaticKey
+                  arrayItem={row.isArrayItem || row.isRoot}
+                  label={row.keyLabel}
+                />
+              ) : null}
+              <StaticValue
+                multiline={row.multiline}
+                onDoubleClick={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  onSelect(row.path, path)
+                  openValueEditor(row)
+                }}
+                value={row.value}
               />
-              <StaticValue value={row.value} />
             </div>
           ))}
 
@@ -320,7 +541,14 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
                     event.stopPropagation()
                     onSelect(row.path, path)
                   }}
+                  onDoubleClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    onSelect(row.path, path)
+                    openValueEditor(row)
+                  }}
                   onPointerDown={(event) => event.stopPropagation()}
+                  title="双击编辑"
                   type="button"
                 >
                   {row.type === 'array'
@@ -371,7 +599,7 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
               onPointerDown={(event) => event.stopPropagation()}
               position={Position.Right}
               style={{
-                top: 24 + (row.order + 0.5) * 24,
+                top: 24 + row.offsetY + row.height / 2,
               }}
               tabIndex={0}
               title={row.expanded ? '收起分支' : '展开分支'}
@@ -381,50 +609,136 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
         ))}
       </article>
 
-      {contextMenu &&
-        createPortal(
-          <div
-            aria-label="字段操作菜单"
-            className="json-row-context-menu"
-            onContextMenu={(event) => event.preventDefault()}
-            onPointerDown={(event) => event.stopPropagation()}
-            role="menu"
-            style={{ left: contextMenu.x, top: contextMenu.y }}
-          >
-            <button
-              autoFocus
-              onClick={() => copyContextItem('value')}
-              role="menuitem"
-              type="button"
+      {contextMenu
+        ? createPortal(
+            <div className="json-context-portals">
+            <div
+              aria-label="字段操作菜单"
+              className="json-row-context-menu"
+              onContextMenu={(event) => event.preventDefault()}
+              onPointerDown={(event) => event.stopPropagation()}
+              ref={menuRef}
+              role="menu"
+              style={{ left: contextMenu.x, top: contextMenu.y }}
             >
-              <Copy size={13} />
-              <span>复制 Value</span>
-            </button>
-            <button
-              onClick={() => copyContextItem('key')}
-              role="menuitem"
-              type="button"
-            >
-              <KeyRound size={13} />
-              <span>复制 Key</span>
-            </button>
-            <button
-              disabled={contextMenu.type === 'null'}
-              onClick={editContextValue}
-              role="menuitem"
-              title={
-                contextMenu.type === 'null'
-                  ? 'null 类型没有可编辑内容'
-                  : undefined
-              }
-              type="button"
-            >
-              <Pencil size={13} />
-              <span>编辑 Value</span>
-            </button>
-          </div>,
-          document.body,
-        )}
+              <div className="json-row-context-menu-meta">
+                <strong title={contextMenu.mode === 'card' ? title : contextMenu.copyKey}>
+                  {contextMenu.mode === 'card' ? title : contextMenu.copyKey}
+                </strong>
+                {contextMenu.mode === 'row' ? (
+                  <span>{contextMenu.type}</span>
+                ) : null}
+              </div>
+              {hasParent ? (
+                <button onClick={focusParentNode} role="menuitem" type="button">
+                  <CornerLeftUp size={13} />
+                  <span>定位到父节点</span>
+                </button>
+              ) : null}
+              {contextMenu.mode === 'card' && canGoto ? (
+                <div className={`context-goto ${gotoOpen ? 'is-open' : ''}`}>
+                  <button
+                    aria-expanded={gotoOpen}
+                    aria-haspopup="menu"
+                    onClick={openGoto}
+                    onMouseEnter={openGoto}
+                    onMouseLeave={scheduleCloseGoto}
+                    ref={gotoTriggerRef}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <CornerDownRight size={13} />
+                    <span>前往</span>
+                    <ChevronRight className="context-goto-chevron" size={12} />
+                  </button>
+                </div>
+              ) : null}
+              {contextMenu.mode === 'row' ? (
+                <>
+                  <button
+                    onClick={() => copyContextItem('value')}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <Copy size={13} />
+                    <span>复制 Value</span>
+                  </button>
+                  <button
+                    onClick={() => copyContextItem('key')}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <KeyRound size={13} />
+                    <span>复制 Key</span>
+                  </button>
+                  <button
+                    disabled={contextMenu.type === 'null'}
+                    onClick={editContextValue}
+                    role="menuitem"
+                    title={
+                      contextMenu.type === 'null'
+                        ? 'null 类型没有可编辑内容'
+                        : undefined
+                    }
+                    type="button"
+                  >
+                    <Pencil size={13} />
+                    <span>编辑 Value</span>
+                  </button>
+                </>
+              ) : null}
+            </div>
+            {gotoOpen && contextMenu.mode === 'card' ? (
+              <div
+                className="json-row-context-menu context-goto-flyout"
+                onContextMenu={(event) => event.preventDefault()}
+                onMouseEnter={openGoto}
+                onMouseLeave={scheduleCloseGoto}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={gotoMenuRef}
+                role="menu"
+                style={gotoMenuStyle}
+              >
+                {primitiveRows.length > 0 ? (
+                  <div className="context-goto-props">
+                    {primitiveRows.map((row) => (
+                      <div className="context-goto-prop" key={pathToId(row.path)}>
+                        <span className="context-goto-prop-key">
+                          {row.keyLabel || title}
+                        </span>
+                        <span
+                          className={`context-goto-prop-value value-${row.type}`}
+                          title={previewPrimitive(row.value)}
+                        >
+                          {previewPrimitive(row.value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {childTargets.length > 0 ? (
+                  <div className="context-goto-group">
+                    <span className="context-goto-label">Outgoing</span>
+                    {childTargets.map((target) => (
+                      <button
+                        key={`child-${pathToId(target.path)}`}
+                        onClick={() => focusNavTarget(target.path)}
+                        role="menuitem"
+                        title={target.label}
+                        type="button"
+                      >
+                        <CornerDownRight size={12} />
+                        <span>{target.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
 
       {valueEditor &&
         createPortal(
@@ -465,12 +779,8 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
                     saveEditedValue()
                   }
                 }}
-                rows={
-                  valueEditor.type === 'object' ||
-                  valueEditor.type === 'array'
-                    ? 12
-                    : 4
-                }
+                ref={valueEditorInputRef}
+                rows={1}
                 spellCheck={false}
                 value={valueEditor.draft}
               />
@@ -478,6 +788,14 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
                 <p className="value-editor-error">{valueEditor.error}</p>
               )}
               <footer>
+                <button
+                  className="value-editor-copy"
+                  onClick={copyEditorDraft}
+                  type="button"
+                >
+                  <Copy size={13} />
+                  复制
+                </button>
                 <button
                   className="value-editor-cancel"
                   onClick={() => setValueEditor(null)}

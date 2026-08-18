@@ -11,12 +11,15 @@ import {
   type EdgeTypes,
   type NodeTypes,
 } from '@xyflow/react'
+import { Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { SearchPanel } from './SearchPanel'
 import { ReadOnlyJsonCardNode } from './ReadOnlyJsonCardNode'
 import { getChannelOffset, NaturalEdge } from './NaturalEdge'
 import { pathToId, type JsonPath } from './json'
 import {
   layoutGraph,
+  rowAnchorY,
   type GraphDefinition,
   type JsonFlowNode,
 } from './graph'
@@ -196,8 +199,7 @@ function getEdgeChannels(
     )
     if (!sourceRow) return
 
-    const sourceY =
-      sourceNode.position.y + 24 + (sourceRow.order + 0.5) * 24
+    const sourceY = sourceNode.position.y + rowAnchorY(sourceRow)
     const targetY =
       targetNode.position.y + (Number(targetNode.style?.height) || 0) / 2
     const targetX = targetNode.position.x
@@ -282,6 +284,7 @@ function getEdgeChannels(
 export interface FocusRequest {
   id: string
   nonce: number
+  path?: JsonPath
 }
 
 interface DiagramCanvasProps {
@@ -289,8 +292,15 @@ interface DiagramCanvasProps {
   dark: boolean
   focusRequest: FocusRequest | null
   onClearSelection: () => void
+  onSearchChange: (value: string) => void
+  onSearchClose: () => void
+  onSearchIndexChange: (index: number) => void
+  onSearchOpen: () => void
   onSelectEdge: (edgeId: string, sourcePath: JsonPath) => void
   preserveViewportRequest: number
+  searchIndex: number
+  searchOpen: boolean
+  searchTerm: string
   selectedEdgeId: string | null
   selectedNodeId: string | null
   stale: boolean
@@ -301,8 +311,15 @@ function DiagramCanvas({
   dark,
   focusRequest,
   onClearSelection,
+  onSearchChange,
+  onSearchClose,
+  onSearchIndexChange,
+  onSearchOpen,
   onSelectEdge,
   preserveViewportRequest,
+  searchIndex,
+  searchOpen,
+  searchTerm,
   selectedEdgeId,
   selectedNodeId,
   stale,
@@ -315,7 +332,7 @@ function DiagramCanvas({
   const fitTimerRef = useRef<number | null>(null)
   const handledFocusRequestRef = useRef<string | null>(null)
   const handledPreserveRequestRef = useRef(0)
-  const { fitBounds, fitView, getViewport, setViewport } =
+  const { fitBounds, fitView, getViewport, setCenter, setViewport } =
     useReactFlow<JsonFlowNode>()
 
   useEffect(
@@ -357,14 +374,14 @@ function DiagramCanvas({
           style: {
             stroke: edgeSelected
               ? dark
-                ? '#d8bf63'
+                ? '#e4c56a'
                 : '#aa9134'
               : edgeHovered
                 ? dark
-                  ? '#56d4a4'
+                  ? '#4fd4a8'
                   : '#27a978'
               : dark
-                ? '#686b75'
+                ? '#6a7388'
                 : '#b8bbc2',
             strokeDasharray:
               edgeSelected || edgeHovered ? '6 5' : undefined,
@@ -436,9 +453,11 @@ function DiagramCanvas({
           }
         })
       })
-      window.requestAnimationFrame(() => {
-        void setViewport(viewportBeforeUpdate, { duration: 0 })
-      })
+      if (!focusRequest) {
+        window.requestAnimationFrame(() => {
+          void setViewport(viewportBeforeUpdate, { duration: 0 })
+        })
+      }
       return
     }
 
@@ -481,6 +500,7 @@ function DiagramCanvas({
 
         setNodes(nextNodes)
         setLayoutPending(false)
+        if (focusRequest) return
         if (viewportBeforeLayout) {
           window.requestAnimationFrame(() => {
             void setViewport(viewportBeforeLayout, { duration: 0 })
@@ -527,6 +547,7 @@ function DiagramCanvas({
   }, [
     definition,
     fitBounds,
+    focusRequest,
     getViewport,
     preserveViewportRequest,
     setViewport,
@@ -540,16 +561,35 @@ function DiagramCanvas({
     if (!target) return
     handledFocusRequestRef.current = requestKey
 
+    const focusPath = focusRequest.path
+    const focusRow = focusPath
+      ? [...target.data.primitiveRows, ...target.data.containerRows].find(
+          (row) => pathToId(row.path) === pathToId(focusPath),
+        )
+      : undefined
+
     window.requestAnimationFrame(() => {
-      void fitView({
-        nodes: [target],
-        duration: 500,
-        padding: 0.9,
-        minZoom: 0.65,
-        maxZoom: 1.1,
+      window.requestAnimationFrame(() => {
+        if (focusRow) {
+          const width = Number(target.style?.width) || 220
+          void setCenter(
+            target.position.x + width / 2,
+            target.position.y + rowAnchorY(focusRow),
+            { duration: 420, zoom: 1.28 },
+          )
+          return
+        }
+
+        void fitView({
+          nodes: [{ id: target.id }],
+          duration: 420,
+          padding: 0.16,
+          minZoom: 0.22,
+          maxZoom: 1.6,
+        })
       })
     })
-  }, [fitView, focusRequest, layoutPending, nodes])
+  }, [fitView, focusRequest, layoutPending, nodes, setCenter])
 
   const onNodesChange = useCallback((changes: NodeChange<JsonFlowNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current))
@@ -603,18 +643,51 @@ function DiagramCanvas({
         proOptions={{ hideAttribution: true }}
       >
         <Background
-          color={dark ? '#454a58' : '#cbd2d9'}
+          color={dark ? '#2c3344' : '#cbd2d9'}
           gap={16}
           size={1}
           variant={BackgroundVariant.Dots}
         />
-        <Controls
-          className="json-flow-controls"
-          fitViewOptions={{ duration: 400, padding: 0.24, maxZoom: 1.15 }}
-          orientation="horizontal"
-          position="bottom-center"
-          showInteractive={false}
-        />
+        {searchOpen && (
+          <SearchPanel
+            activeIndex={searchIndex}
+            matches={definition.matches}
+            onActiveIndexChange={onSearchIndexChange}
+            onClose={onSearchClose}
+            onQueryChange={onSearchChange}
+            query={searchTerm}
+          />
+        )}
+        <div
+          className="canvas-dock nodrag nopan"
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="canvas-toolbar">
+            <button
+              aria-expanded={searchOpen}
+              aria-label="搜索键、值或路径"
+              className="canvas-search-toggle"
+              onClick={() => {
+                if (searchOpen) {
+                  onSearchClose()
+                  return
+                }
+                onSearchOpen()
+              }}
+              title="搜索"
+              type="button"
+            >
+              <Search size={13} strokeWidth={2.2} />
+            </button>
+            <Controls
+              className="json-flow-controls"
+              fitViewOptions={{ duration: 400, padding: 0.24, maxZoom: 1.15 }}
+              orientation="horizontal"
+              position="bottom-center"
+              showInteractive={false}
+            />
+          </div>
+        </div>
       </ReactFlow>
 
       {layoutPending && (

@@ -1,6 +1,7 @@
 import type { Edge, Node } from '@xyflow/react'
 import ELK from 'elkjs/lib/elk.bundled.js'
 import {
+  copyKeyForPath,
   formatPath,
   getValueType,
   isContainer,
@@ -23,6 +24,9 @@ export interface PrimitiveRow {
   isRoot: boolean
   matched: boolean
   selected: boolean
+  multiline: boolean
+  height: number
+  offsetY: number
 }
 
 export interface ContainerRow {
@@ -39,6 +43,8 @@ export interface ContainerRow {
   isArrayItem: boolean
   matched: boolean
   selected: boolean
+  height: number
+  offsetY: number
 }
 
 export interface JsonNodeData extends Record<string, unknown> {
@@ -76,26 +82,113 @@ export interface GraphActions {
   onToggleBranch: JsonNodeData['onToggleBranch']
 }
 
+export interface SearchMatch {
+  keyLabel: string
+  nodeId: string
+  path: JsonPath
+  valueText: string
+}
+
 export interface GraphDefinition {
   nodes: JsonFlowNode[]
   edges: Edge[]
   signature: string
   matchCount: number
+  matches: SearchMatch[]
   dimUnselected: boolean
 }
 
-const NODE_WIDTH = 220
-const ROOT_NODE_WIDTH = 190
+const NODE_WIDTH = 240
+const ROOT_NODE_WIDTH = 220
+const MAX_CARD_WIDTH = 380
 const ROW_HEIGHT = 24
 const HEADER_HEIGHT = 24
-const NODE_VERTICAL_GAP = 24
+const NODE_VERTICAL_GAP = 16
+const LAYER_HORIZONTAL_GAP = 64
+const LAYER_PADDING_LEFT = 36
+const LAYER_PADDING_TOP = 36
 const MIN_KEY_COLUMN_WIDTH = 72
 const MIN_VALUE_COLUMN_WIDTH = 112
+const MULTILINE_LINE_HEIGHT = 16
+const MULTILINE_ROW_PADDING = 8
+const MULTILINE_CJK_WIDTH = 10
+const MULTILINE_ASCII_WIDTH = 6
 const NODE_TONES: NodeTone[] = ['cyan', 'purple', 'green', 'amber', 'rose']
 
-function nodeHeight(rowCount: number, collapsed: boolean): number {
-  if (collapsed) return HEADER_HEIGHT
-  return HEADER_HEIGHT + Math.max(rowCount, 1) * ROW_HEIGHT
+export function rowAnchorY(row: { height: number; offsetY: number }): number {
+  return HEADER_HEIGHT + row.offsetY + row.height / 2
+}
+
+function isLongText(value: JsonPrimitive, valueWidth = MIN_VALUE_COLUMN_WIDTH): boolean {
+  if (typeof value !== 'string' || value.length === 0) return false
+  if (value.includes('\n')) return true
+  return textPixelWidth(value) > valueWidth - 8
+}
+
+function neededValueWidth(value: JsonPrimitive): number {
+  if (typeof value !== 'string' || value.length === 0) {
+    return MIN_VALUE_COLUMN_WIDTH
+  }
+  if (value.includes('\n')) return MAX_CARD_WIDTH
+  return Math.min(MAX_CARD_WIDTH, textPixelWidth(value) + 12)
+}
+
+function textPixelWidth(text: string): number {
+  return Array.from(text).reduce((width, character) => {
+    const code = character.codePointAt(0) ?? 0
+    return width + (code > 0xff ? MULTILINE_CJK_WIDTH : MULTILINE_ASCII_WIDTH)
+  }, 0)
+}
+
+function estimateWrappedLines(text: string, maxWidth: number): number {
+  return text.split('\n').reduce((count, line) => {
+    if (line.length === 0) return count + 1
+    return count + Math.max(1, Math.ceil(textPixelWidth(line) / maxWidth))
+  }, 0)
+}
+
+function estimateRowHeight(
+  value: JsonPrimitive,
+  valueWidth: number,
+): { height: number; multiline: boolean } {
+  if (typeof value !== 'string' || !isLongText(value, valueWidth)) {
+    return { height: ROW_HEIGHT, multiline: false }
+  }
+  const lines = estimateWrappedLines(
+    value.replace(/\n+$/u, ''),
+    Math.max(80, valueWidth - 8),
+  )
+  return {
+    multiline: true,
+    height: Math.max(
+      ROW_HEIGHT,
+      Math.ceil(MULTILINE_ROW_PADDING + lines * MULTILINE_LINE_HEIGHT),
+    ),
+  }
+}
+
+function assignRowMetrics(
+  primitiveRows: PrimitiveRow[],
+  containerRows: ContainerRow[],
+  valueWidth: number,
+): number {
+  const rows: Array<PrimitiveRow | ContainerRow> = [
+    ...primitiveRows,
+    ...containerRows,
+  ].sort((left, right) => left.order - right.order)
+
+  let offsetY = 0
+  rows.forEach((row) => {
+    const measured =
+      'value' in row
+        ? estimateRowHeight(row.value, valueWidth)
+        : { height: ROW_HEIGHT, multiline: false }
+    row.height = measured.height
+    row.offsetY = offsetY
+    if ('value' in row) row.multiline = measured.multiline
+    offsetY += measured.height
+  })
+  return offsetY
 }
 
 function keyLabel(key: string | number, isRoot: boolean): string {
@@ -170,7 +263,7 @@ export function buildGraph(
   const nodes: JsonFlowNode[] = []
   const edges: Edge[] = []
   const query = searchTerm.trim().toLocaleLowerCase()
-  let matchCount = 0
+  const matches: SearchMatch[] = []
 
   const visit = (
     current: JsonValue,
@@ -193,11 +286,25 @@ export function buildGraph(
         ? Object.entries(current)
         : [['value', current]]
 
+    const isLeafPrimitive = !isContainer(current)
     entries.forEach(([key, child], order) => {
-      const isRootPrimitive = path.length === 0 && !isContainer(current)
-      const childPath = isRootPrimitive ? path : [...path, key]
+      const isRootPrimitive = path.length === 0 && isLeafPrimitive
+      const childPath = isLeafPrimitive || isRootPrimitive ? path : [...path, key]
       const matched = rowMatches(query, key, child, childPath)
-      if (matched) matchCount += 1
+      if (matched) {
+        matches.push({
+          keyLabel: String(key),
+          nodeId: id,
+          path: childPath,
+          valueText: isContainer(child)
+            ? Array.isArray(child)
+              ? `[${child.length} items]`
+              : `{${Object.keys(child).length} keys}`
+            : child === null
+              ? 'null'
+              : String(child),
+        })
+      }
 
       if (isContainer(child)) {
         const flattenedArray =
@@ -209,7 +316,7 @@ export function buildGraph(
           : Object.keys(child).length > 0
         containerRows.push({
           keyLabel: keyLabel(key, false),
-          copyKey: String(key),
+          copyKey: copyKeyForPath(childPath, String(key)),
           copyValue: copyValue(child),
           order,
           path: childPath,
@@ -224,23 +331,28 @@ export function buildGraph(
             selectedNodeId === id &&
             selectedPath !== null &&
             pathsEqual(childPath, selectedPath),
+          height: ROW_HEIGHT,
+          offsetY: 0,
         })
       } else {
         primitiveRows.push({
-          keyLabel: keyLabel(key, isRootPrimitive),
-          copyKey: String(key),
+          keyLabel: isLeafPrimitive ? '' : keyLabel(key, isRootPrimitive),
+          copyKey: copyKeyForPath(childPath, String(key)),
           copyValue: copyValue(child),
           order,
           path: childPath,
           value: child,
           type: getValueType(child) as PrimitiveRow['type'],
           isArrayItem: typeof key === 'number',
-          isRoot: isRootPrimitive,
+          isRoot: isLeafPrimitive || isRootPrimitive,
           matched,
           selected:
             selectedNodeId === id &&
             selectedPath !== null &&
             pathsEqual(childPath, selectedPath),
+          multiline: false,
+          height: ROW_HEIGHT,
+          offsetY: 0,
         })
       }
     })
@@ -249,17 +361,31 @@ export function buildGraph(
     const nodeMatched =
       Boolean(query) &&
       `${title} ${pathLabel} ${kind}`.toLocaleLowerCase().includes(query)
-    if (nodeMatched) matchCount += 1
     const size = isContainer(current)
       ? Array.isArray(current)
         ? current.length
         : Object.keys(current).length
       : 1
-    const rowCount = primitiveRows.length + containerRows.length
-    const keyColumnWidth = getKeyColumnWidth([
-      ...primitiveRows,
-      ...containerRows,
-    ])
+    const keyColumnWidth = isLeafPrimitive
+      ? 0
+      : getKeyColumnWidth([...primitiveRows, ...containerRows])
+    const valueNeeded = Math.max(
+      MIN_VALUE_COLUMN_WIDTH,
+      ...primitiveRows.map((row) => neededValueWidth(row.value)),
+    )
+    const cardWidth = Math.min(
+      MAX_CARD_WIDTH,
+      Math.max(
+        path.length === 0 ? ROOT_NODE_WIDTH : NODE_WIDTH,
+        keyColumnWidth + valueNeeded + 14,
+      ),
+    )
+    const valueColumnWidth = Math.max(80, cardWidth - keyColumnWidth - 14)
+    const bodyHeight = assignRowMetrics(
+      primitiveRows,
+      containerRows,
+      valueColumnWidth,
+    )
     const nodeSelected = selectedNodeId === id
     const rootNodeSelected =
       selectedNodeId === 'json-root' &&
@@ -291,11 +417,10 @@ export function buildGraph(
         ...actions,
       },
       style: {
-        width: Math.max(
-          path.length === 0 ? ROOT_NODE_WIDTH : NODE_WIDTH,
-          keyColumnWidth + MIN_VALUE_COLUMN_WIDTH + 14,
-        ),
-        height: nodeHeight(rowCount, collapsed),
+        width: cardWidth,
+        height: collapsed
+          ? HEADER_HEIGHT
+          : HEADER_HEIGHT + Math.max(bodyHeight, ROW_HEIGHT),
       },
     })
 
@@ -378,7 +503,9 @@ export function buildGraph(
     })
   }
 
-  const signature = `${nodes.map((node) => node.id).join('|')}::${edges
+  const signature = `${nodes
+    .map((node) => `${node.id}:${node.style?.width}x${node.style?.height}`)
+    .join('|')}::${edges
     .map((edge) => `${edge.source}:${edge.sourceHandle ?? ''}>${edge.target}`)
     .join('|')}`
 
@@ -391,7 +518,14 @@ export function buildGraph(
         selectedPath.length === 0
       ))
 
-  return { nodes, edges, signature, matchCount, dimUnselected }
+  return {
+    nodes,
+    edges,
+    signature,
+    matchCount: matches.length,
+    matches,
+    dimUnselected,
+  }
 }
 
 function getChild(parent: JsonValue, parentPath: JsonPath, childPath: JsonPath): JsonValue {
@@ -410,11 +544,237 @@ function getChild(parent: JsonValue, parentPath: JsonPath, childPath: JsonPath):
 
 const elk = new ELK()
 
+interface SubtreeLayout {
+  bottomContour: number[]
+  children: Array<{ layout: SubtreeLayout; subtreeOffsetY: number }>
+  nodeHeight: number
+  nodeId: string
+  nodeOffsetY: number
+  nodeWidth: number
+  subtreeHeight: number
+  topContour: number[]
+}
+
+function nodeBox(node: JsonFlowNode): { height: number; width: number } {
+  return {
+    height: Number(node.style?.height) || 0,
+    width: Number(node.style?.width) || NODE_WIDTH,
+  }
+}
+
+function childEdgesFor(
+  nodeId: string,
+  nodeById: Map<string, JsonFlowNode>,
+  outgoingBySource: Map<string, Edge[]>,
+): Edge[] {
+  const parent = nodeById.get(nodeId)
+  const edges = [...(outgoingBySource.get(nodeId) ?? [])]
+  return edges.sort((left, right) => {
+    const leftRow = parent?.data.containerRows.find(
+      (row) => pathToId(row.path) === left.sourceHandle?.replace(/^source-/, ''),
+    )
+    const rightRow = parent?.data.containerRows.find(
+      (row) => pathToId(row.path) === right.sourceHandle?.replace(/^source-/, ''),
+    )
+    const rowDelta = (leftRow?.offsetY ?? 0) - (rightRow?.offsetY ?? 0)
+    if (rowDelta !== 0) return rowDelta
+    return (leftRow?.order ?? 0) - (rightRow?.order ?? 0)
+  })
+}
+
+function measureSubtree(
+  nodeId: string,
+  nodeById: Map<string, JsonFlowNode>,
+  outgoingBySource: Map<string, Edge[]>,
+): SubtreeLayout {
+  const node = nodeById.get(nodeId)
+  const { height: nodeHeight, width: nodeWidth } = node
+    ? nodeBox(node)
+    : { height: 0, width: NODE_WIDTH }
+  const childEdges = childEdgesFor(nodeId, nodeById, outgoingBySource)
+
+  if (childEdges.length === 0) {
+    return {
+      bottomContour: [nodeHeight],
+      children: [],
+      nodeHeight,
+      nodeId,
+      nodeOffsetY: 0,
+      nodeWidth,
+      subtreeHeight: nodeHeight,
+      topContour: [0],
+    }
+  }
+
+  const childLayouts = childEdges.map((edge) =>
+    measureSubtree(edge.target, nodeById, outgoingBySource),
+  )
+
+  const packed: Array<{ layout: SubtreeLayout; y: number }> = []
+  const mergedTop: number[] = []
+  const mergedBottom: number[] = []
+
+  childLayouts.forEach((layout) => {
+    let y = 0
+    if (packed.length > 0) {
+      const overlap = Math.min(mergedBottom.length, layout.topContour.length)
+      for (let depth = 0; depth < overlap; depth += 1) {
+        y = Math.max(
+          y,
+          mergedBottom[depth] + NODE_VERTICAL_GAP - layout.topContour[depth],
+        )
+      }
+    }
+    packed.push({ layout, y })
+    layout.topContour.forEach((top, depth) => {
+      const bottom = layout.bottomContour[depth]
+      const shiftedTop = top + y
+      const shiftedBottom = bottom + y
+      if (depth >= mergedTop.length) {
+        mergedTop[depth] = shiftedTop
+        mergedBottom[depth] = shiftedBottom
+        return
+      }
+      mergedTop[depth] = Math.min(mergedTop[depth], shiftedTop)
+      mergedBottom[depth] = Math.max(mergedBottom[depth], shiftedBottom)
+    })
+  })
+
+  const childrenTop = Math.min(...packed.map((item) => item.y))
+  const childrenBottom = Math.max(
+    ...packed.map((item) => item.y + item.layout.subtreeHeight),
+  )
+  const nodeTop = (childrenTop + childrenBottom - nodeHeight) / 2
+  const origin = Math.min(nodeTop, childrenTop)
+  const nodeOffsetY = nodeTop - origin
+  const children = packed.map((item) => ({
+    layout: item.layout,
+    subtreeOffsetY: item.y - origin,
+  }))
+  const subtreeHeight = Math.max(
+    nodeOffsetY + nodeHeight,
+    childrenBottom - origin,
+  )
+
+  const topContour = [nodeOffsetY]
+  const bottomContour = [nodeOffsetY + nodeHeight]
+  children.forEach((child) => {
+    child.layout.topContour.forEach((top, depth) => {
+      const contourDepth = depth + 1
+      const shiftedTop = top + child.subtreeOffsetY
+      const shiftedBottom = child.layout.bottomContour[depth] + child.subtreeOffsetY
+      if (contourDepth >= topContour.length) {
+        topContour[contourDepth] = shiftedTop
+        bottomContour[contourDepth] = shiftedBottom
+        return
+      }
+      topContour[contourDepth] = Math.min(topContour[contourDepth], shiftedTop)
+      bottomContour[contourDepth] = Math.max(
+        bottomContour[contourDepth],
+        shiftedBottom,
+      )
+    })
+  })
+
+  return {
+    bottomContour,
+    children,
+    nodeHeight,
+    nodeId,
+    nodeOffsetY,
+    nodeWidth,
+    subtreeHeight,
+    topContour,
+  }
+}
+
+function collectLayerWidths(
+  layout: SubtreeLayout,
+  depth: number,
+  widths: number[],
+) {
+  widths[depth] = Math.max(widths[depth] ?? 0, layout.nodeWidth)
+  layout.children.forEach((child) => {
+    collectLayerWidths(child.layout, depth + 1, widths)
+  })
+}
+
+function layerOrigins(widths: number[]): number[] {
+  const origins = [LAYER_PADDING_LEFT]
+  widths.forEach((width, depth) => {
+    origins[depth + 1] = origins[depth] + width + LAYER_HORIZONTAL_GAP
+  })
+  return origins
+}
+
+function assignSubtreePositions(
+  layout: SubtreeLayout,
+  depth: number,
+  subtreeY: number,
+  origins: number[],
+  positions: Map<string, { x: number; y: number }>,
+) {
+  positions.set(layout.nodeId, {
+    x: origins[depth] ?? LAYER_PADDING_LEFT,
+    y: subtreeY + layout.nodeOffsetY,
+  })
+  layout.children.forEach((child) => {
+    assignSubtreePositions(
+      child.layout,
+      depth + 1,
+      subtreeY + child.subtreeOffsetY,
+      origins,
+      positions,
+    )
+  })
+}
+
+function layoutGraphRight(
+  nodes: JsonFlowNode[],
+  edges: Edge[],
+): JsonFlowNode[] {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const outgoingBySource = new Map<string, Edge[]>()
+  const incomingTargets = new Set<string>()
+  edges.forEach((edge) => {
+    const outgoing = outgoingBySource.get(edge.source) ?? []
+    outgoing.push(edge)
+    outgoingBySource.set(edge.source, outgoing)
+    incomingTargets.add(edge.target)
+  })
+
+  const positions = new Map<string, { x: number; y: number }>()
+  const roots = nodes.filter((node) => !incomingTargets.has(node.id))
+  let forestY = LAYER_PADDING_TOP
+  roots.forEach((root) => {
+    const layout = measureSubtree(root.id, nodeById, outgoingBySource)
+    const widths: number[] = []
+    collectLayerWidths(layout, 0, widths)
+    assignSubtreePositions(
+      layout,
+      0,
+      forestY,
+      layerOrigins(widths),
+      positions,
+    )
+    forestY += layout.subtreeHeight + NODE_VERTICAL_GAP
+  })
+
+  return nodes.map((node) => ({
+    ...node,
+    position: positions.get(node.id) ?? node.position,
+  }))
+}
+
 export async function layoutGraph(
   nodes: JsonFlowNode[],
   edges: Edge[],
   direction: 'RIGHT' | 'DOWN',
 ): Promise<JsonFlowNode[]> {
+  if (direction === 'RIGHT') {
+    return layoutGraphRight(nodes, edges)
+  }
+
   const graph = await elk.layout({
     id: 'json-graph',
     layoutOptions: {
@@ -431,6 +791,9 @@ export async function layoutGraph(
       id: node.id,
       width: Number(node.style?.width) || NODE_WIDTH,
       height: Number(node.style?.height) || 180,
+      layoutOptions: {
+        'elk.nodeSize.constraints': 'FIXED',
+      },
     })),
     edges: edges.map((edge) => ({
       id: edge.id,
@@ -446,9 +809,6 @@ export async function layoutGraph(
     ]),
   )
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const modelOrderById = new Map(
-    nodes.map((node, index) => [node.id, index]),
-  )
 
   nodes.forEach((node) => {
     const targets = edges
@@ -466,127 +826,21 @@ export async function layoutGraph(
           bottom: position.y + (Number(target.style?.height) || 0),
         }
       })
-      .filter((bounds): bounds is { top: number; bottom: number } => bounds !== null)
+      .filter(
+        (bounds): bounds is { top: number; bottom: number } =>
+          bounds !== null,
+      )
     if (targetBounds.length < 2) return
 
     const position = positions.get(node.id)
     if (!position) return
     const top = Math.min(...targetBounds.map((bounds) => bounds.top))
     const bottom = Math.max(...targetBounds.map((bounds) => bounds.bottom))
-    const desiredY = (top + bottom - (Number(node.style?.height) || 0)) / 2
     positions.set(node.id, {
       ...position,
-      y: desiredY,
+      y: (top + bottom - (Number(node.style?.height) || 0)) / 2,
     })
   })
-
-  if (direction === 'RIGHT') {
-    const outgoingBySource = new Map<string, Edge[]>()
-    edges.forEach((edge) => {
-      const outgoing = outgoingBySource.get(edge.source) ?? []
-      outgoing.push(edge)
-      outgoingBySource.set(edge.source, outgoing)
-    })
-
-    const shiftBranch = (rootId: string, deltaY: number) => {
-      const queue = [rootId]
-      const visited = new Set<string>()
-
-      while (queue.length > 0) {
-        const nodeId = queue.shift()
-        if (!nodeId || visited.has(nodeId)) continue
-        visited.add(nodeId)
-
-        const position = positions.get(nodeId)
-        if (position) {
-          positions.set(nodeId, { ...position, y: position.y + deltaY })
-        }
-        outgoingBySource
-          .get(nodeId)
-          ?.forEach((edge) => queue.push(edge.target))
-      }
-    }
-
-    nodes.forEach((node) => {
-      const outgoing = outgoingBySource.get(node.id)
-      if (outgoing?.length !== 1) return
-
-      const edge = outgoing[0]
-      const sourcePosition = positions.get(node.id)
-      const targetPosition = positions.get(edge.target)
-      const targetNode = nodeById.get(edge.target)
-      const sourceHandleId = edge.sourceHandle?.replace(/^source-/, '')
-      const sourceRow = node.data.containerRows.find(
-        (row) => pathToId(row.path) === sourceHandleId,
-      )
-      if (!sourcePosition || !targetPosition || !targetNode || !sourceRow) return
-
-      const sourceY =
-        sourcePosition.y +
-        HEADER_HEIGHT +
-        (sourceRow.order + 0.5) * ROW_HEIGHT
-      const targetY =
-        targetPosition.y + (Number(targetNode.style?.height) || 0) / 2
-      shiftBranch(edge.target, sourceY - targetY)
-    })
-
-    const incomingNodeIds = new Set(edges.map((edge) => edge.target))
-    const layerById = new Map<string, number>()
-    const layerQueue = nodes
-      .filter((node) => !incomingNodeIds.has(node.id))
-      .map((node) => node.id)
-    layerQueue.forEach((nodeId) => layerById.set(nodeId, 0))
-
-    while (layerQueue.length > 0) {
-      const nodeId = layerQueue.shift()
-      if (!nodeId) continue
-      const nextLayer = (layerById.get(nodeId) ?? 0) + 1
-      outgoingBySource.get(nodeId)?.forEach((edge) => {
-        if ((layerById.get(edge.target) ?? -1) >= nextLayer) return
-        layerById.set(edge.target, nextLayer)
-        layerQueue.push(edge.target)
-      })
-    }
-
-    const layers = new Map<number, JsonFlowNode[]>()
-    nodes.forEach((node) => {
-      const position = positions.get(node.id)
-      if (!position) return
-      const layer = layerById.get(node.id) ?? 0
-      const layerNodes = layers.get(layer) ?? []
-      layerNodes.push(node)
-      layers.set(layer, layerNodes)
-    })
-
-    const orderedLayers = [...layers.entries()].sort(
-      ([left], [right]) => left - right,
-    )
-    orderedLayers.forEach(([, layerNodes]) => {
-      let nextAvailableY = Number.NEGATIVE_INFINITY
-
-      layerNodes
-        .sort(
-          (left, right) =>
-            (modelOrderById.get(left.id) ?? 0) -
-            (modelOrderById.get(right.id) ?? 0),
-        )
-        .forEach((node) => {
-          const position = positions.get(node.id)
-          if (!position) return
-
-          if (position.y < nextAvailableY) {
-            shiftBranch(node.id, nextAvailableY - position.y)
-          }
-
-          const adjustedPosition = positions.get(node.id)
-          if (!adjustedPosition) return
-          nextAvailableY =
-            adjustedPosition.y +
-            (Number(node.style?.height) || 0) +
-            NODE_VERTICAL_GAP
-        })
-    })
-  }
 
   return nodes.map((node) => ({
     ...node,
