@@ -12,7 +12,9 @@ import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { json } from '@codemirror/lang-json'
-import type { EditorView, ViewUpdate } from '@codemirror/view'
+import { keymap, type EditorView, type ViewUpdate } from '@codemirror/view'
+import { Prec } from '@codemirror/state'
+import { search } from '@codemirror/search'
 import { tags } from '@lezer/highlight'
 import {
   Braces,
@@ -30,6 +32,7 @@ import {
   Moon,
   PanelLeftClose,
   Plus,
+  Search,
   Sparkles,
   Sun,
   Upload,
@@ -37,6 +40,7 @@ import {
 import { Diagram, type FocusRequest } from './Diagram'
 import { buildGraph, type GraphActions } from './graph'
 import { findJsonPathAtOffset, locateJsonPath } from './jsonSource'
+import { SourceSearch, type SourceSearchHandle } from './SourceSearch'
 import {
   SAMPLE_JSON,
   copyKeyForPath,
@@ -105,8 +109,8 @@ function cardPathForSelection(value: JsonValue, path: JsonPath): JsonPath {
 const STORAGE_KEY = 'json-canvas-document-v1'
 const WORKSPACE_STORAGE_KEY = 'json-canvas-workspace-v2'
 const THEME_KEY = 'json-canvas-theme'
-const EDITOR_FONT_KEY = 'json-canvas-editor-font'
-const EDITOR_FONT_DEFAULT = 11
+const EDITOR_FONT_KEY = 'json-canvas-editor-font-v2'
+const EDITOR_FONT_DEFAULT = 12
 const EDITOR_FONT_MIN = 10
 const EDITOR_FONT_MAX = 18
 
@@ -359,6 +363,11 @@ export default function App() {
   const valueRef = useRef(jsonValue)
   const documentsRef = useRef(initialWorkspace.documents)
   const editorViewRef = useRef<EditorView | null>(null)
+  const sourceSearchRef = useRef<SourceSearchHandle | null>(null)
+  const sourceSearchOpenRef = useRef(false)
+  const openSourceSearchRef = useRef<(withReplace?: boolean) => void>(() => {})
+  const [editorView, setEditorView] = useState<EditorView | null>(null)
+  const [sourceSearchOpen, setSourceSearchOpen] = useState(false)
   const syncingSelectionRef = useRef(false)
   const expectedEditorSelectionRef = useRef<{
     anchor: number
@@ -543,6 +552,16 @@ export default function App() {
       if (event.key === '0') {
         event.preventDefault()
         changeEditorFontSize(EDITOR_FONT_DEFAULT)
+        return
+      }
+      if (event.key.toLowerCase() === 'f') {
+        event.preventDefault()
+        openSourceSearchRef.current(false)
+        return
+      }
+      if (event.key.toLowerCase() === 'h') {
+        event.preventDefault()
+        openSourceSearchRef.current(true)
       }
     }
 
@@ -553,6 +572,10 @@ export default function App() {
       window.removeEventListener('keydown', onKeyDown)
     }
   }, [changeEditorFontSize, editorVisible])
+
+  useEffect(() => {
+    if (!editorVisible) setSourceSearchOpen(false)
+  }, [editorVisible])
 
   useEffect(() => {
     document.title = 'JSON Canvas'
@@ -1023,6 +1046,76 @@ export default function App() {
     ],
     [dark],
   )
+  const sourceSearchExtension = useMemo(
+    () => [
+      search({ top: true }),
+      Prec.high(
+        keymap.of([
+          {
+            key: 'Mod-f',
+            preventDefault: true,
+            stopPropagation: true,
+            run: () => {
+              openSourceSearchRef.current(false)
+              return true
+            },
+          },
+          {
+            key: 'Mod-h',
+            preventDefault: true,
+            stopPropagation: true,
+            run: () => {
+              openSourceSearchRef.current(true)
+              return true
+            },
+          },
+          {
+            key: 'F3',
+            run: () => {
+              if (sourceSearchOpenRef.current) {
+                sourceSearchRef.current?.move(1)
+              } else {
+                openSourceSearchRef.current(false)
+              }
+              return true
+            },
+            shift: () => {
+              if (sourceSearchOpenRef.current) {
+                sourceSearchRef.current?.move(-1)
+              } else {
+                openSourceSearchRef.current(false)
+              }
+              return true
+            },
+          },
+          {
+            key: 'Mod-g',
+            preventDefault: true,
+            run: () => {
+              sourceSearchRef.current?.move(1)
+              return true
+            },
+            shift: () => {
+              sourceSearchRef.current?.move(-1)
+              return true
+            },
+          },
+        ]),
+      ),
+    ],
+    [],
+  )
+  const editorExtensions = useMemo(
+    () => [...jsonExtension, ...sourceSearchExtension],
+    [jsonExtension, sourceSearchExtension],
+  )
+
+  sourceSearchOpenRef.current = sourceSearchOpen
+  openSourceSearchRef.current = (withReplace = false) => {
+    const view = editorViewRef.current
+    if (!view) return
+    sourceSearchRef.current?.open(view, withReplace)
+  }
 
   const handleEditorUpdate = useCallback(
     (update: ViewUpdate) => {
@@ -1433,6 +1526,14 @@ export default function App() {
                   </button>
                 </div>
                 <button
+                  className="icon-button"
+                  onClick={() => openSourceSearchRef.current(false)}
+                  title="查找 (Ctrl+F)"
+                  type="button"
+                >
+                  <Search size={15} />
+                </button>
+                <button
                   className="panel-button"
                   onClick={() => void copySource()}
                   title="复制 JSON"
@@ -1467,6 +1568,13 @@ export default function App() {
               onContextMenu={handleEditorContextMenu}
               style={{ ['--editor-font-size' as string]: `${editorFontSize}px` }}
             >
+              <SourceSearch
+                onOpenChange={setSourceSearchOpen}
+                open={sourceSearchOpen}
+                ref={sourceSearchRef}
+                source={source}
+                view={editorView}
+              />
               <CodeMirror
                 basicSetup={{
                   bracketMatching: true,
@@ -1475,12 +1583,14 @@ export default function App() {
                   highlightActiveLine: true,
                   highlightSelectionMatches: false,
                   lineNumbers: true,
+                  searchKeymap: false,
                 }}
-                extensions={jsonExtension}
+                extensions={editorExtensions}
                 height="100%"
                 onChange={handleSourceChange}
                 onCreateEditor={(view) => {
                   editorViewRef.current = view
+                  setEditorView(view)
                 }}
                 onUpdate={handleEditorUpdate}
                 theme="none"
