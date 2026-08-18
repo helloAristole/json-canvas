@@ -504,8 +504,10 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
           {containerRows.map((row) => (
             <div
               className={`json-node-row nodrag nopan ${
-                row.matched ? 'row-match' : ''
-              } ${row.selected ? 'is-selected-row' : ''} ${
+                row.type === 'array' ? 'is-item-row' : ''
+              } ${row.matched ? 'row-match' : ''} ${
+                row.selected ? 'is-selected-row' : ''
+              } ${
                 pathToId(row.path) === hoveredSourcePathId
                   ? 'is-hovered-relation-row'
                   : ''

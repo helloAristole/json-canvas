@@ -10,14 +10,14 @@ export function getChannelOffset(
   channelIndex: number,
   channelCount: number,
 ): number {
-  const defaultOffset = Math.min(36, Math.max(18, horizontalGap / 2))
+  const defaultOffset = Math.min(28, Math.max(16, horizontalGap / 2.4))
   if (channelCount <= 1) return defaultOffset
 
-  const minimumOffset = Math.min(14, horizontalGap / 3)
-  const maximumOffset = Math.max(minimumOffset, horizontalGap - 14)
+  const minimumOffset = Math.min(12, horizontalGap / 3.2)
+  const maximumOffset = Math.max(minimumOffset, horizontalGap - 12)
   const availableWidth = maximumOffset - minimumOffset
   const channelSpacing = Math.min(
-    12,
+    10,
     availableWidth / Math.max(1, channelCount - 1),
   )
   const totalWidth = channelSpacing * (channelCount - 1)
@@ -65,8 +65,8 @@ export function NaturalEdge({
     targetY,
     targetPosition,
     centerX,
-    borderRadius: 4,
-    offset: 10,
+    borderRadius: 5,
+    offset: 4,
   })
 
   return <BaseEdge id={id} path={path} style={style} />

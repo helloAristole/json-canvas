@@ -103,10 +103,10 @@ const ROOT_NODE_WIDTH = 220
 const MAX_CARD_WIDTH = 380
 const ROW_HEIGHT = 24
 const HEADER_HEIGHT = 24
-const NODE_VERTICAL_GAP = 16
-const LAYER_HORIZONTAL_GAP = 64
-const LAYER_PADDING_LEFT = 36
-const LAYER_PADDING_TOP = 36
+const NODE_VERTICAL_GAP = 10
+const LAYER_HORIZONTAL_GAP = 52
+const LAYER_PADDING_LEFT = 24
+const LAYER_PADDING_TOP = 24
 const MIN_KEY_COLUMN_WIDTH = 72
 const MIN_VALUE_COLUMN_WIDTH = 112
 const MULTILINE_LINE_HEIGHT = 16
@@ -582,6 +582,49 @@ function childEdgesFor(
   })
 }
 
+function sourceRowAnchorY(parent: JsonFlowNode | undefined, edge: Edge): number {
+  if (!parent) return HEADER_HEIGHT + ROW_HEIGHT / 2
+  const handleId = edge.sourceHandle?.replace(/^source-/, '')
+  const row = parent.data.containerRows.find(
+    (item) => pathToId(item.path) === handleId,
+  )
+  return row ? rowAnchorY(row) : HEADER_HEIGHT + ROW_HEIGHT / 2
+}
+
+function packShift(
+  mergedBottom: number[],
+  topContour: number[],
+): number {
+  const overlap = Math.min(mergedBottom.length, topContour.length)
+  let y = 0
+  for (let depth = 0; depth < overlap; depth += 1) {
+    y = Math.max(
+      y,
+      mergedBottom[depth] + NODE_VERTICAL_GAP - topContour[depth],
+    )
+  }
+  return y
+}
+
+function mergePackedContour(
+  mergedTop: number[],
+  mergedBottom: number[],
+  layout: SubtreeLayout,
+  y: number,
+) {
+  layout.topContour.forEach((top, depth) => {
+    const shiftedTop = top + y
+    const shiftedBottom = layout.bottomContour[depth] + y
+    if (depth >= mergedTop.length) {
+      mergedTop[depth] = shiftedTop
+      mergedBottom[depth] = shiftedBottom
+      return
+    }
+    mergedTop[depth] = Math.min(mergedTop[depth], shiftedTop)
+    mergedBottom[depth] = Math.max(mergedBottom[depth], shiftedBottom)
+  })
+}
+
 function measureSubtree(
   nodeId: string,
   nodeById: Map<string, JsonFlowNode>,
@@ -614,39 +657,24 @@ function measureSubtree(
   const mergedTop: number[] = []
   const mergedBottom: number[] = []
 
-  childLayouts.forEach((layout) => {
-    let y = 0
-    if (packed.length > 0) {
-      const overlap = Math.min(mergedBottom.length, layout.topContour.length)
-      for (let depth = 0; depth < overlap; depth += 1) {
-        y = Math.max(
-          y,
-          mergedBottom[depth] + NODE_VERTICAL_GAP - layout.topContour[depth],
-        )
-      }
-    }
+  childLayouts.forEach((layout, index) => {
+    const preferredY =
+      sourceRowAnchorY(node, childEdges[index]) -
+      (layout.nodeOffsetY + layout.nodeHeight / 2)
+    const y =
+      packed.length === 0
+        ? preferredY
+        : Math.max(preferredY, packShift(mergedBottom, layout.topContour))
     packed.push({ layout, y })
-    layout.topContour.forEach((top, depth) => {
-      const bottom = layout.bottomContour[depth]
-      const shiftedTop = top + y
-      const shiftedBottom = bottom + y
-      if (depth >= mergedTop.length) {
-        mergedTop[depth] = shiftedTop
-        mergedBottom[depth] = shiftedBottom
-        return
-      }
-      mergedTop[depth] = Math.min(mergedTop[depth], shiftedTop)
-      mergedBottom[depth] = Math.max(mergedBottom[depth], shiftedBottom)
-    })
+    mergePackedContour(mergedTop, mergedBottom, layout, y)
   })
 
   const childrenTop = Math.min(...packed.map((item) => item.y))
   const childrenBottom = Math.max(
     ...packed.map((item) => item.y + item.layout.subtreeHeight),
   )
-  const nodeTop = (childrenTop + childrenBottom - nodeHeight) / 2
-  const origin = Math.min(nodeTop, childrenTop)
-  const nodeOffsetY = nodeTop - origin
+  const origin = Math.min(0, childrenTop)
+  const nodeOffsetY = -origin
   const children = packed.map((item) => ({
     layout: item.layout,
     subtreeOffsetY: item.y - origin,
@@ -662,7 +690,8 @@ function measureSubtree(
     child.layout.topContour.forEach((top, depth) => {
       const contourDepth = depth + 1
       const shiftedTop = top + child.subtreeOffsetY
-      const shiftedBottom = child.layout.bottomContour[depth] + child.subtreeOffsetY
+      const shiftedBottom =
+        child.layout.bottomContour[depth] + child.subtreeOffsetY
       if (contourDepth >= topContour.length) {
         topContour[contourDepth] = shiftedTop
         bottomContour[contourDepth] = shiftedBottom

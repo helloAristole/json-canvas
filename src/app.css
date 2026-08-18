@@ -1749,12 +1749,40 @@ select:focus-visible {
   background: color-mix(in srgb, #38af80 8%, var(--panel));
 }
 
+.json-node-row.is-item-row {
+  background: #f8f7f4;
+}
+
+.json-node-row.is-item-row:hover {
+  background: #f3f1ec;
+}
+
+.json-node-row.is-item-row.row-match {
+  background: #e4f3e4;
+}
+
+.json-node-row.is-item-row.is-selected-row {
+  background: color-mix(in srgb, #6d9ce8 16%, var(--panel));
+}
+
+.json-node-row.is-item-row.is-hovered-relation-row {
+  background: color-mix(in srgb, #38af80 8%, var(--panel));
+}
+
 .tone-cyan .json-node-row {
   grid-template-columns: 72px minmax(0, 1fr);
 }
 
 :root[data-theme='dark'] .json-node-row {
   border-bottom-color: rgba(255, 255, 255, 0.045);
+}
+
+:root[data-theme='dark'] .json-node-row.is-item-row {
+  background: rgba(255, 255, 255, 0.028);
+}
+
+:root[data-theme='dark'] .json-node-row.is-item-row:hover {
+  background: rgba(255, 255, 255, 0.045);
 }
 
 .json-key-cell {
