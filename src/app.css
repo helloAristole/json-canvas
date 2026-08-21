@@ -1730,11 +1730,14 @@ select:focus-visible {
 
 .json-node-row.is-multiline .json-value {
   height: auto;
-  overflow: visible;
+  max-height: 192px;
+  overflow-x: hidden;
+  overflow-y: auto;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
   text-overflow: unset;
+  scrollbar-width: thin;
 }
 
 .json-node-row.is-leaf-text {

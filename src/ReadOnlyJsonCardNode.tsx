@@ -157,7 +157,9 @@ function StaticValue({
 
   return (
     <span
-      className={`json-value value-${type} ${multiline ? 'is-multiline' : ''}`}
+      className={`json-value value-${type} ${
+        multiline ? 'is-multiline nowheel nopan' : ''
+      }`}
       onDoubleClick={onDoubleClick}
       title={type === 'null' ? text : `${text}\n双击编辑`}
     >

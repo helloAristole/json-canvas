@@ -114,6 +114,7 @@ const MULTILINE_LINE_HEIGHT = 16
 const MULTILINE_ROW_PADDING = 10
 const MULTILINE_CJK_WIDTH = 11
 const MULTILINE_ASCII_WIDTH = 6.25
+const MAX_MULTILINE_LINES = 12
 const NODE_TONES: NodeTone[] = ['cyan', 'purple', 'green', 'amber', 'rose']
 
 export function rowAnchorY(row: { height: number; offsetY: number }): number {
@@ -135,10 +136,10 @@ function neededValueWidth(value: JsonPrimitive): number {
 }
 
 function textPixelWidth(text: string): number {
-  return Array.from(text).reduce((width, character) => {
-    const code = character.codePointAt(0) ?? 0
-    return width + (code > 0xff ? MULTILINE_CJK_WIDTH : MULTILINE_ASCII_WIDTH)
-  }, 0)
+  return Array.from(text).reduce(
+    (width, character) => width + charPixelWidth(character),
+    0,
+  )
 }
 
 function charPixelWidth(character: string): number {
@@ -150,18 +151,14 @@ function wrapLineCount(line: string, maxWidth: number): number {
   if (line.length === 0) return 1
   let lines = 1
   let used = 0
-  Array.from(line).forEach((character) => {
-    const width = charPixelWidth(character)
+  for (const character of Array.from(line)) {
+    const width = Math.min(maxWidth, charPixelWidth(character))
     if (used > 0 && used + width > maxWidth) {
       lines += 1
       used = 0
     }
     used += width
-    if (used > maxWidth) {
-      lines += 1
-      used = 0
-    }
-  })
+  }
   return lines
 }
 
@@ -179,9 +176,12 @@ function estimateRowHeight(
   if (typeof value !== 'string' || !isLongText(value, valueWidth)) {
     return { height: ROW_HEIGHT, multiline: false }
   }
-  const lines = estimateWrappedLines(
-    value.replace(/\n+$/u, ''),
-    Math.max(80, valueWidth - 12),
+  const lines = Math.min(
+    MAX_MULTILINE_LINES,
+    estimateWrappedLines(
+      value.replace(/\n+$/u, ''),
+      Math.max(80, valueWidth - 12),
+    ),
   )
   return {
     multiline: true,

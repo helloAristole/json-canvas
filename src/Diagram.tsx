@@ -39,12 +39,33 @@ const edgeTypes = {
 const SOURCE_HANDLE_ROUTE_OFFSET = 14
 const TARGET_CHANNEL_GUTTER = 22
 
-function layerRightX(sourceNode: JsonFlowNode, nodes: JsonFlowNode[]): number {
+function layerRightByX(nodes: JsonFlowNode[]): Map<number, number> {
+  const rights = new Map<number, number>()
+  nodes.forEach((node) => {
+    const layerX = node.position.x
+    const right = layerX + (Number(node.style?.width) || 0)
+    let matched = false
+    rights.forEach((value, cachedX) => {
+      if (Math.abs(cachedX - layerX) <= 2) {
+        rights.set(cachedX, Math.max(value, right))
+        matched = true
+      }
+    })
+    if (!matched) rights.set(layerX, right)
+  })
+  return rights
+}
+
+function layerRightX(
+  sourceNode: JsonFlowNode,
+  rights: Map<number, number>,
+): number {
   const layerX = sourceNode.position.x
-  return nodes.reduce((right, node) => {
-    if (Math.abs(node.position.x - layerX) > 2) return right
-    return Math.max(right, node.position.x + (Number(node.style?.width) || 0))
-  }, sourceNode.position.x)
+  let right = sourceNode.position.x
+  rights.forEach((value, cachedX) => {
+    if (Math.abs(cachedX - layerX) <= 2) right = Math.max(right, value)
+  })
+  return right
 }
 
 interface EdgeChannel {
@@ -196,6 +217,7 @@ function getEdgeChannels(
   const channels = new Map<string, EdgeChannel>()
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const groupsBySource = new Map<string, Map<string, EdgeGroup>>()
+  const layerRights = layerRightByX(nodes)
 
   edges.forEach((edge) => {
     const sourceNode = nodeById.get(edge.source)
@@ -259,7 +281,7 @@ function getEdgeChannels(
 
     const sourceNode = nodeById.get(sourceId)
     if (!sourceNode) return
-    const sourceX = layerRightX(sourceNode, nodes) + SOURCE_HANDLE_ROUTE_OFFSET
+    const sourceX = layerRightX(sourceNode, layerRights) + SOURCE_HANDLE_ROUTE_OFFSET
     const targetLeft = groups.reduce(
       (closest, group) =>
         group.targetXs.reduce(
@@ -355,6 +377,17 @@ function DiagramCanvas({
     if (next <= 0) return
     const previous = measuredHeightsRef.current.get(id)
     if (previous !== undefined && Math.abs(previous - next) < 2) return
+    const estimated = Number(
+      nodesRef.current.find((node) => node.id === id)?.style?.height,
+    )
+    if (
+      previous === undefined &&
+      Number.isFinite(estimated) &&
+      Math.abs(estimated - next) < 2
+    ) {
+      measuredHeightsRef.current.set(id, next)
+      return
+    }
     measuredHeightsRef.current.set(id, next)
     if (measureFrameRef.current !== null) return
     measureFrameRef.current = window.requestAnimationFrame(() => {
@@ -373,12 +406,16 @@ function DiagramCanvas({
     [],
   )
 
+  const edgeChannels = useMemo(
+    () => getEdgeChannels(definition.edges, nodes),
+    [definition.edges, nodes],
+  )
+
   const edges = useMemo(
     () => {
       const hasSelectedEdge =
         selectedEdgeId !== null &&
         definition.edges.some((edge) => edge.id === selectedEdgeId)
-      const edgeChannels = getEdgeChannels(definition.edges, nodes)
 
       return definition.edges.map((edge) => {
         const edgeSelected = hasSelectedEdge && edge.id === selectedEdgeId
@@ -434,8 +471,8 @@ function DiagramCanvas({
       dark,
       definition.dimUnselected,
       definition.edges,
+      edgeChannels,
       hoveredEdgeId,
-      nodes,
       selectedEdgeId,
       selectedNodeId,
     ],
@@ -680,6 +717,7 @@ function DiagramCanvas({
         nodes={renderedNodes}
         nodesConnectable={false}
         nodesDraggable={false}
+        elevateNodesOnSelect={false}
         onEdgeClick={(event, edge) => {
           event.stopPropagation()
           setHoveredEdgeId(null)

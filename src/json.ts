@@ -8,10 +8,6 @@ export const SAMPLE_JSON: JsonValue = {
   project: 'JSON Canvas',
   version: 1,
   active: true,
-  owner: {
-    name: '祝许浩',
-    role: 'Software engineer',
-  },
   features: [
     {
       name: '实时预览',
