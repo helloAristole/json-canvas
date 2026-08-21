@@ -930,7 +930,8 @@ select:focus-visible {
 }
 
 .json-node-row:hover {
-  background: color-mix(in srgb, var(--accent) 3.5%, var(--panel));
+  background: color-mix(in srgb, #6d9ce8 14%, var(--panel));
+  box-shadow: inset 2px 0 #8b96e0;
 }
 
 .json-node-row.row-match {
@@ -1754,7 +1755,8 @@ select:focus-visible {
 }
 
 .json-node-row.is-item-row:hover {
-  background: #f3f1ec;
+  background: color-mix(in srgb, #6d9ce8 14%, var(--panel));
+  box-shadow: inset 2px 0 #8b96e0;
 }
 
 .json-node-row.is-item-row.row-match {
@@ -1763,6 +1765,11 @@ select:focus-visible {
 
 .json-node-row.is-item-row.is-selected-row {
   background: color-mix(in srgb, #6d9ce8 16%, var(--panel));
+}
+
+.json-node-row.is-item-row.is-selected-row:hover {
+  background: color-mix(in srgb, #6d9ce8 20%, var(--panel));
+  box-shadow: inset 2px 0 #6875dc;
 }
 
 .json-node-row.is-item-row.is-hovered-relation-row {
@@ -1777,12 +1784,17 @@ select:focus-visible {
   border-bottom-color: rgba(255, 255, 255, 0.045);
 }
 
+:root[data-theme='dark'] .json-node-row:hover {
+  background: color-mix(in srgb, #6d9ce8 22%, var(--panel));
+  box-shadow: inset 2px 0 #8b96e0;
+}
+
 :root[data-theme='dark'] .json-node-row.is-item-row {
   background: rgba(255, 255, 255, 0.028);
 }
 
 :root[data-theme='dark'] .json-node-row.is-item-row:hover {
-  background: rgba(255, 255, 255, 0.045);
+  background: color-mix(in srgb, #6d9ce8 22%, var(--panel));
 }
 
 .json-key-cell {
@@ -2089,6 +2101,7 @@ select:focus-visible {
 }
 
 .node-target-handle {
+  top: 12px !important;
   width: 2px !important;
   height: 2px !important;
   opacity: 0;

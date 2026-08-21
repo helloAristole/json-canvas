@@ -60,6 +60,7 @@ export interface JsonNodeData extends Record<string, unknown> {
   selectionState: 'normal' | 'selected' | 'dimmed'
   relationHoverState?: 'source' | 'target'
   hoveredSourcePathId?: string
+  onMeasuredHeight?: (id: string, height: number) => void
   primitiveRows: PrimitiveRow[]
   containerRows: ContainerRow[]
   onFocus: (path: JsonPath) => void
@@ -102,17 +103,17 @@ const NODE_WIDTH = 240
 const ROOT_NODE_WIDTH = 220
 const MAX_CARD_WIDTH = 380
 const ROW_HEIGHT = 24
-const HEADER_HEIGHT = 24
-const NODE_VERTICAL_GAP = 10
-const LAYER_HORIZONTAL_GAP = 52
+export const HEADER_HEIGHT = 24
+const NODE_VERTICAL_GAP = 20
+const LAYER_HORIZONTAL_GAP = 76
 const LAYER_PADDING_LEFT = 24
 const LAYER_PADDING_TOP = 24
 const MIN_KEY_COLUMN_WIDTH = 72
 const MIN_VALUE_COLUMN_WIDTH = 112
 const MULTILINE_LINE_HEIGHT = 16
-const MULTILINE_ROW_PADDING = 8
-const MULTILINE_CJK_WIDTH = 10
-const MULTILINE_ASCII_WIDTH = 6
+const MULTILINE_ROW_PADDING = 10
+const MULTILINE_CJK_WIDTH = 11
+const MULTILINE_ASCII_WIDTH = 6.25
 const NODE_TONES: NodeTone[] = ['cyan', 'purple', 'green', 'amber', 'rose']
 
 export function rowAnchorY(row: { height: number; offsetY: number }): number {
@@ -140,11 +141,35 @@ function textPixelWidth(text: string): number {
   }, 0)
 }
 
+function charPixelWidth(character: string): number {
+  const code = character.codePointAt(0) ?? 0
+  return code > 0xff ? MULTILINE_CJK_WIDTH : MULTILINE_ASCII_WIDTH
+}
+
+function wrapLineCount(line: string, maxWidth: number): number {
+  if (line.length === 0) return 1
+  let lines = 1
+  let used = 0
+  Array.from(line).forEach((character) => {
+    const width = charPixelWidth(character)
+    if (used > 0 && used + width > maxWidth) {
+      lines += 1
+      used = 0
+    }
+    used += width
+    if (used > maxWidth) {
+      lines += 1
+      used = 0
+    }
+  })
+  return lines
+}
+
 function estimateWrappedLines(text: string, maxWidth: number): number {
-  return text.split('\n').reduce((count, line) => {
-    if (line.length === 0) return count + 1
-    return count + Math.max(1, Math.ceil(textPixelWidth(line) / maxWidth))
-  }, 0)
+  return text.split('\n').reduce(
+    (count, line) => count + wrapLineCount(line, maxWidth),
+    0,
+  )
 }
 
 function estimateRowHeight(
@@ -156,7 +181,7 @@ function estimateRowHeight(
   }
   const lines = estimateWrappedLines(
     value.replace(/\n+$/u, ''),
-    Math.max(80, valueWidth - 8),
+    Math.max(80, valueWidth - 12),
   )
   return {
     multiline: true,

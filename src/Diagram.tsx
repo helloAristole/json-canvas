@@ -20,6 +20,7 @@ import { pathToId, type JsonPath } from './json'
 import {
   layoutGraph,
   rowAnchorY,
+  HEADER_HEIGHT,
   type GraphDefinition,
   type JsonFlowNode,
 } from './graph'
@@ -35,8 +36,16 @@ const edgeTypes = {
 // React Flow attaches a right-positioned edge to the outer edge of the
 // 24px source hit area (right: -6px), and the target to the outer edge of
 // its 5px handle. Include those offsets when building a shared corridor.
-const SOURCE_HANDLE_ROUTE_OFFSET = 18
-const TARGET_HANDLE_ROUTE_OFFSET = -2.5
+const SOURCE_HANDLE_ROUTE_OFFSET = 14
+const TARGET_CHANNEL_GUTTER = 22
+
+function layerRightX(sourceNode: JsonFlowNode, nodes: JsonFlowNode[]): number {
+  const layerX = sourceNode.position.x
+  return nodes.reduce((right, node) => {
+    if (Math.abs(node.position.x - layerX) > 2) return right
+    return Math.max(right, node.position.x + (Number(node.style?.width) || 0))
+  }, sourceNode.position.x)
+}
 
 interface EdgeChannel {
   index: number
@@ -200,8 +209,7 @@ function getEdgeChannels(
     if (!sourceRow) return
 
     const sourceY = sourceNode.position.y + rowAnchorY(sourceRow)
-    const targetY =
-      targetNode.position.y + (Number(targetNode.style?.height) || 0) / 2
+    const targetY = targetNode.position.y + HEADER_HEIGHT / 2
     const targetX = targetNode.position.x
     const sourceGroups =
       groupsBySource.get(edge.source) ?? new Map<string, EdgeGroup>()
@@ -250,24 +258,24 @@ function getEdgeChannels(
     }
 
     const sourceNode = nodeById.get(sourceId)
-    const sourceX =
-      (sourceNode?.position.x ?? 0) +
-      (Number(sourceNode?.style?.width) || 0) +
-      SOURCE_HANDLE_ROUTE_OFFSET
-    const targetX =
-      groups.reduce(
-        (closest, group) =>
-          group.targetXs.reduce(
-            (groupClosest, value) => Math.min(groupClosest, value),
-            closest,
-          ),
-        Number.POSITIVE_INFINITY,
-      ) + TARGET_HANDLE_ROUTE_OFFSET
-    const horizontalGap = Math.max(0, targetX - sourceX)
+    if (!sourceNode) return
+    const sourceX = layerRightX(sourceNode, nodes) + SOURCE_HANDLE_ROUTE_OFFSET
+    const targetLeft = groups.reduce(
+      (closest, group) =>
+        group.targetXs.reduce(
+          (groupClosest, value) => Math.min(groupClosest, value),
+          closest,
+        ),
+      Number.POSITIVE_INFINITY,
+    )
+    const maxChannelX = targetLeft - TARGET_CHANNEL_GUTTER
+    const horizontalGap = Math.max(0, maxChannelX - sourceX)
 
     groups.forEach((group, channelIndex) => {
-      const channelX =
-        sourceX + getChannelOffset(horizontalGap, channelIndex, groups.length)
+      const channelX = Math.min(
+        maxChannelX,
+        sourceX + getChannelOffset(horizontalGap, channelIndex, groups.length),
+      )
       group.edgeIds.forEach((edgeId) => {
         channels.set(edgeId, {
           index: channelIndex,
@@ -327,17 +335,40 @@ function DiagramCanvas({
   const [nodes, setNodes] = useState<JsonFlowNode[]>([])
   const [layoutPending, setLayoutPending] = useState(true)
   const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null)
+  const [heightRevision, setHeightRevision] = useState(0)
   const signatureRef = useRef('')
   const layoutRunRef = useRef(0)
   const fitTimerRef = useRef<number | null>(null)
+  const measureFrameRef = useRef<number | null>(null)
+  const measuredHeightsRef = useRef(new Map<string, number>())
+  const appliedHeightRevisionRef = useRef(0)
+  const hasFittedRef = useRef(false)
   const handledFocusRequestRef = useRef<string | null>(null)
   const handledPreserveRequestRef = useRef(0)
+  const nodesRef = useRef<JsonFlowNode[]>([])
+  nodesRef.current = nodes
   const { fitBounds, fitView, getViewport, setCenter, setViewport } =
     useReactFlow<JsonFlowNode>()
+
+  const reportNodeHeight = useCallback((id: string, height: number) => {
+    const next = Math.ceil(height)
+    if (next <= 0) return
+    const previous = measuredHeightsRef.current.get(id)
+    if (previous !== undefined && Math.abs(previous - next) < 2) return
+    measuredHeightsRef.current.set(id, next)
+    if (measureFrameRef.current !== null) return
+    measureFrameRef.current = window.requestAnimationFrame(() => {
+      measureFrameRef.current = null
+      setHeightRevision((value) => value + 1)
+    })
+  }, [])
 
   useEffect(
     () => () => {
       if (fitTimerRef.current !== null) window.clearTimeout(fitTimerRef.current)
+      if (measureFrameRef.current !== null) {
+        window.cancelAnimationFrame(measureFrameRef.current)
+      }
     },
     [],
   )
@@ -411,17 +442,27 @@ function DiagramCanvas({
   )
 
   const renderedNodes = useMemo<JsonFlowNode[]>(() => {
-    if (selectedEdgeId !== null || hoveredEdgeId === null) return nodes
-    const hoveredEdge = definition.edges.find(
-      (edge) => edge.id === hoveredEdgeId,
-    )
-    if (!hoveredEdge) return nodes
-
-    const sourcePathId = hoveredEdge.sourceHandle?.replace(/^source-/, '')
-    return nodes.map((node) => ({
+    const withMeasure = (node: JsonFlowNode): JsonFlowNode => ({
       ...node,
       data: {
         ...node.data,
+        onMeasuredHeight: reportNodeHeight,
+      },
+    })
+    if (selectedEdgeId !== null || hoveredEdgeId === null) {
+      return nodes.map(withMeasure)
+    }
+    const hoveredEdge = definition.edges.find(
+      (edge) => edge.id === hoveredEdgeId,
+    )
+    if (!hoveredEdge) return nodes.map(withMeasure)
+
+    const sourcePathId = hoveredEdge.sourceHandle?.replace(/^source-/, '')
+    return nodes.map((node) => ({
+      ...withMeasure(node),
+      data: {
+        ...node.data,
+        onMeasuredHeight: reportNodeHeight,
         relationHoverState:
           node.id === hoveredEdge.target
             ? 'target'
@@ -432,14 +473,30 @@ function DiagramCanvas({
           node.id === hoveredEdge.source ? sourcePathId : undefined,
       },
     }))
-  }, [definition.edges, hoveredEdgeId, nodes, selectedEdgeId])
+  }, [
+    definition.edges,
+    hoveredEdgeId,
+    nodes,
+    reportNodeHeight,
+    selectedEdgeId,
+  ])
 
   useEffect(() => {
     const structureChanged = signatureRef.current !== definition.signature
+    const heightRelayout = heightRevision !== appliedHeightRevisionRef.current
     const preserveViewport =
       handledPreserveRequestRef.current !== preserveViewportRequest
 
-    if (!structureChanged) {
+    const applyMeasuredHeight = (node: JsonFlowNode): JsonFlowNode => {
+      const measuredHeight = measuredHeightsRef.current.get(node.id)
+      if (measuredHeight == null) return node
+      return {
+        ...node,
+        style: { ...node.style, height: measuredHeight },
+      }
+    }
+
+    if (!structureChanged && !heightRelayout) {
       const viewportBeforeUpdate = getViewport()
       handledPreserveRequestRef.current = preserveViewportRequest
       setNodes((currentNodes) => {
@@ -447,7 +504,7 @@ function DiagramCanvas({
         return definition.nodes.map((node) => {
           const current = currentById.get(node.id)
           return {
-            ...node,
+            ...applyMeasuredHeight(node),
             position: current?.position ?? node.position,
             selected: current?.selected,
           }
@@ -461,21 +518,32 @@ function DiagramCanvas({
       return
     }
 
+    if (structureChanged) {
+      measuredHeightsRef.current.clear()
+      hasFittedRef.current = false
+    }
     handledPreserveRequestRef.current = preserveViewportRequest
     signatureRef.current = definition.signature
+    appliedHeightRevisionRef.current = heightRevision
     const run = layoutRunRef.current + 1
     layoutRunRef.current = run
-    if (fitTimerRef.current !== null) {
+    const keepViewport =
+      preserveViewport || (heightRelayout && hasFittedRef.current)
+    if (!keepViewport && fitTimerRef.current !== null) {
       window.clearTimeout(fitTimerRef.current)
       fitTimerRef.current = null
     }
-    const viewportBeforeLayout = preserveViewport ? getViewport() : null
-    const anchorBeforeLayout = preserveViewport
-      ? nodes.find((node) => node.id === 'json-root')
+    const viewportBeforeLayout = keepViewport ? getViewport() : null
+    const anchorBeforeLayout = keepViewport
+      ? nodesRef.current.find((node) => node.id === 'json-root')
       : undefined
-    setLayoutPending(true)
+    if (structureChanged) setLayoutPending(true)
 
-    layoutGraph(definition.nodes, definition.edges, 'RIGHT')
+    layoutGraph(
+      definition.nodes.map(applyMeasuredHeight),
+      definition.edges,
+      'RIGHT',
+    )
       .then((layoutedNodes) => {
         if (layoutRunRef.current !== run) return
         let nextNodes = layoutedNodes
@@ -528,6 +596,7 @@ function DiagramCanvas({
         )
         fitTimerRef.current = window.setTimeout(() => {
           const graphHeight = bounds.maxY - bounds.minY
+          hasFittedRef.current = true
           void fitBounds(
             {
               x: bounds.minX + 110,
@@ -541,7 +610,7 @@ function DiagramCanvas({
       })
       .catch(() => {
         if (layoutRunRef.current !== run) return
-        setNodes(definition.nodes)
+        setNodes(definition.nodes.map(applyMeasuredHeight))
         setLayoutPending(false)
       })
   }, [
@@ -549,6 +618,7 @@ function DiagramCanvas({
     fitBounds,
     focusRequest,
     getViewport,
+    heightRevision,
     preserveViewportRequest,
     setViewport,
   ])

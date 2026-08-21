@@ -166,7 +166,10 @@ function StaticValue({
   )
 }
 
-function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
+function ReadOnlyJsonCardNodeComponent({
+  data,
+  id,
+}: NodeProps<JsonFlowNode>) {
   const {
     title,
     pathLabel,
@@ -187,6 +190,7 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
     onEditValue,
     onToggle,
     onToggleBranch,
+    onMeasuredHeight,
   } = data
   const canCollapse = kind === 'object' || kind === 'array'
   const isRoot = path.length === 0
@@ -206,6 +210,18 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
   const gotoMenuRef = useRef<HTMLDivElement>(null)
   const gotoCloseTimerRef = useRef<number | null>(null)
   const valueEditorInputRef = useRef<HTMLTextAreaElement>(null)
+  const rootRef = useRef<HTMLElement>(null)
+
+  useLayoutEffect(() => {
+    const node = rootRef.current
+    if (!node || !onMeasuredHeight) return
+
+    const report = () => onMeasuredHeight(id, node.offsetHeight)
+    report()
+    const observer = new ResizeObserver(report)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [collapsed, id, onMeasuredHeight])
 
   const clearGotoCloseTimer = () => {
     if (gotoCloseTimerRef.current !== null) {
@@ -413,12 +429,14 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
         } ${selectionState === 'dimmed' ? 'is-dimmed' : ''} ${
           matched ? 'is-match' : ''
         } ${relationHoverState === 'target' ? 'is-relation-target' : ''}`}
+        ref={rootRef}
       >
       {!isRoot && (
         <Handle
           className="node-target-handle"
           type="target"
           position={Position.Left}
+          style={{ top: 12 }}
         />
       )}
 
@@ -503,11 +521,9 @@ function ReadOnlyJsonCardNodeComponent({ data }: NodeProps<JsonFlowNode>) {
 
           {containerRows.map((row) => (
             <div
-              className={`json-node-row nodrag nopan ${
-                row.type === 'array' ? 'is-item-row' : ''
-              } ${row.matched ? 'row-match' : ''} ${
-                row.selected ? 'is-selected-row' : ''
-              } ${
+              className={`json-node-row nodrag nopan is-item-row ${
+                row.matched ? 'row-match' : ''
+              } ${row.selected ? 'is-selected-row' : ''} ${
                 pathToId(row.path) === hoveredSourcePathId
                   ? 'is-hovered-relation-row'
                   : ''
