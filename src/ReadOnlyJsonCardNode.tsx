@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { JsonDraftEditor } from './JsonDraftEditor'
 import {
   parentCardPath,
   pathToId,
@@ -27,6 +28,12 @@ import {
   type JsonValueType,
 } from './json'
 import type { ContainerRow, JsonFlowNode } from './graph'
+
+const cardEditorOpeners = new Map<string, () => void>()
+
+export function openJsonCardEditor(nodeId: string) {
+  cardEditorOpeners.get(nodeId)?.()
+}
 
 interface NavTarget {
   label: string
@@ -55,6 +62,7 @@ interface ValueEditorState {
   error: string | null
   keyLabel: string
   path: JsonPath
+  scope: 'card' | 'value'
   type: JsonValueType
 }
 
@@ -117,7 +125,9 @@ function parseEditedValue(
     }
     return { error: null, value }
   } catch {
-    return { error: 'Value 格式不正确' }
+    return {
+      error: type === 'object' || type === 'array' ? 'JSON 格式不正确' : 'Value 格式不正确',
+    }
   }
 }
 
@@ -143,6 +153,10 @@ function StaticKey({
   )
 }
 
+function isHexColor(value: string): boolean {
+  return /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(value)
+}
+
 function StaticValue({
   multiline = false,
   onDoubleClick,
@@ -154,15 +168,23 @@ function StaticValue({
 }) {
   const type = value === null ? 'null' : typeof value
   const text = value === null ? 'null' : String(value)
+  const swatch = typeof value === 'string' && isHexColor(value.trim()) ? value.trim() : null
 
   return (
     <span
       className={`json-value value-${type} ${
-        multiline ? 'is-multiline nowheel nopan' : ''
-      }`}
+        swatch ? 'has-color-swatch' : ''
+      } ${multiline ? 'is-multiline nowheel nopan' : ''}`}
       onDoubleClick={onDoubleClick}
       title={type === 'null' ? text : `${text}\n双击编辑`}
     >
+      {swatch ? (
+        <span
+          aria-hidden="true"
+          className="color-swatch"
+          style={{ background: swatch }}
+        />
+      ) : null}
       {text}
     </span>
   )
@@ -180,6 +202,7 @@ function ReadOnlyJsonCardNodeComponent({
     tone,
     keyColumnWidth,
     collapsed,
+    copyValue,
     matched,
     selectionState,
     relationHoverState,
@@ -213,6 +236,7 @@ function ReadOnlyJsonCardNodeComponent({
   const gotoCloseTimerRef = useRef<number | null>(null)
   const valueEditorInputRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLElement>(null)
+  const saveEditedValueRef = useRef<() => void>(() => {})
 
   useLayoutEffect(() => {
     const node = rootRef.current
@@ -304,20 +328,35 @@ function ReadOnlyJsonCardNodeComponent({
   useEffect(() => {
     if (!valueEditor) return
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === 'Escape') setValueEditor(null)
+      if (event.key !== 'Escape' || event.isComposing) return
+      setValueEditor(null)
+    }
+    const saveOnShortcut = (event: globalThis.KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') {
+        return
+      }
+      event.preventDefault()
+      saveEditedValueRef.current()
     }
     window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
+    window.addEventListener('keydown', saveOnShortcut)
+    return () => {
+      window.removeEventListener('keydown', closeOnEscape)
+      window.removeEventListener('keydown', saveOnShortcut)
+    }
   }, [valueEditor])
+
+  const isJsonDraft =
+    valueEditor?.type === 'object' || valueEditor?.type === 'array'
 
   useLayoutEffect(() => {
     const textarea = valueEditorInputRef.current
-    if (!valueEditor || !textarea) return
+    if (!valueEditor || isJsonDraft || !textarea) return
     fitValueEditor(textarea)
-  }, [valueEditor])
+  }, [isJsonDraft, valueEditor])
 
   useEffect(() => {
-    if (!valueEditor) return
+    if (!valueEditor || isJsonDraft) return
     const onResize = () => {
       if (valueEditorInputRef.current) {
         fitValueEditor(valueEditorInputRef.current)
@@ -325,7 +364,7 @@ function ReadOnlyJsonCardNodeComponent({
     }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
-  }, [valueEditor !== null])
+  }, [isJsonDraft, valueEditor !== null])
 
   const menuPosition = (event: ReactMouseEvent<HTMLElement>, height: number) => ({
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 280)),
@@ -357,7 +396,7 @@ function ReadOnlyJsonCardNodeComponent({
     setGotoOpen(false)
     setContextMenu({
       copyKey: title,
-      copyValue: '',
+      copyValue,
       mode: 'card',
       path,
       type: kind,
@@ -388,7 +427,10 @@ function ReadOnlyJsonCardNodeComponent({
     setGotoOpen(false)
   }
 
-  const openValueEditor = (row: CopyableRow) => {
+  const openValueEditor = (
+    row: CopyableRow,
+    scope: 'card' | 'value' = 'value',
+  ) => {
     if (row.type === 'null') return
     setContextMenu(null)
     setGotoOpen(false)
@@ -397,14 +439,44 @@ function ReadOnlyJsonCardNodeComponent({
       error: null,
       keyLabel: row.copyKey,
       path: row.path,
+      scope,
       type: row.type,
     })
   }
 
+  const openCardEditor = (event?: ReactMouseEvent<HTMLElement>) => {
+    event?.preventDefault()
+    event?.stopPropagation()
+    onSelect(path, path)
+    openValueEditor(
+      {
+        copyKey: title,
+        copyValue,
+        path,
+        type: kind,
+      },
+      'card',
+    )
+  }
+
   const editContextValue = () => {
     if (!contextMenu) return
-    openValueEditor(contextMenu)
+    openValueEditor(
+      contextMenu,
+      contextMenu.mode === 'card' ? 'card' : 'value',
+    )
   }
+
+  const openCardEditorRef = useRef(openCardEditor)
+  openCardEditorRef.current = openCardEditor
+
+  useLayoutEffect(() => {
+    const open = () => openCardEditorRef.current()
+    cardEditorOpeners.set(id, open)
+    return () => {
+      cardEditorOpeners.delete(id)
+    }
+  }, [id])
 
   const copyEditorDraft = () => {
     if (!valueEditor) return
@@ -421,16 +493,24 @@ function ReadOnlyJsonCardNodeComponent({
     onEditValue(valueEditor.path, result.value)
     setValueEditor(null)
   }
+  saveEditedValueRef.current = saveEditedValue
+
+  const updateEditorDraft = (draft: string) => {
+    setValueEditor((current) =>
+      current ? { ...current, draft, error: null } : current,
+    )
+  }
 
   return (
     <>
       <article
         aria-selected={selectionState === 'selected'}
-        className={`json-node tone-${tone} ${
+        className={`json-node nodrag nopan tone-${tone} ${
           selectionState === 'selected' ? 'is-selected' : ''
         } ${selectionState === 'dimmed' ? 'is-dimmed' : ''} ${
           matched ? 'is-match' : ''
         } ${relationHoverState === 'target' ? 'is-relation-target' : ''}`}
+        onDoubleClick={openCardEditor}
         ref={rootRef}
       >
       {!isRoot && (
@@ -443,8 +523,10 @@ function ReadOnlyJsonCardNodeComponent({
       )}
 
       <header
-        className="json-node-header"
+        className="json-node-header nodrag nopan"
         onContextMenu={openCardContextMenu}
+        onDoubleClick={openCardEditor}
+        title="双击编辑整张卡片"
       >
         <span className="node-heading">
           <strong title={title}>{title}</strong>
@@ -455,6 +537,7 @@ function ReadOnlyJsonCardNodeComponent({
             aria-label={collapsed ? '展开节点' : '折叠节点'}
             className="node-icon-button nodrag"
             onClick={() => onToggle(path)}
+            onDoubleClick={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
             type="button"
           >
@@ -480,6 +563,12 @@ function ReadOnlyJsonCardNodeComponent({
               onClick={(event) => {
                 event.stopPropagation()
                 onSelect(row.path, path)
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                onSelect(row.path, path)
+                openValueEditor(row)
               }}
               onContextMenu={(event) => openContextMenu(event, row)}
               onKeyDown={(event) => {
@@ -534,6 +623,12 @@ function ReadOnlyJsonCardNodeComponent({
               onClick={(event) => {
                 event.stopPropagation()
                 onSelect(row.path, path)
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                onSelect(row.path, path)
+                openValueEditor(row)
               }}
               onContextMenu={(event) => openContextMenu(event, row)}
               onKeyDown={(event) => {
@@ -673,7 +768,17 @@ function ReadOnlyJsonCardNodeComponent({
                   </button>
                 </div>
               ) : null}
-              {contextMenu.mode === 'row' ? (
+              {contextMenu.mode === 'card' ? (
+                <button
+                  disabled={contextMenu.type === 'null'}
+                  onClick={editContextValue}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Pencil size={13} />
+                  <span>编辑卡片</span>
+                </button>
+              ) : (
                 <>
                   <button
                     onClick={() => copyContextItem('value')}
@@ -706,7 +811,7 @@ function ReadOnlyJsonCardNodeComponent({
                     <span>编辑 Value</span>
                   </button>
                 </>
-              ) : null}
+              )}
             </div>
             {gotoOpen && contextMenu.mode === 'card' ? (
               <div
@@ -770,40 +875,52 @@ function ReadOnlyJsonCardNodeComponent({
             role="presentation"
           >
             <section
-              aria-label={`编辑 ${valueEditor.keyLabel} 的 Value`}
+              aria-label={
+                valueEditor.scope === 'card'
+                  ? `编辑卡片 ${valueEditor.keyLabel}`
+                  : `编辑 ${valueEditor.keyLabel} 的 Value`
+              }
               aria-modal="true"
-              className="value-editor-dialog"
+              className={`value-editor-dialog ${
+                isJsonDraft ? 'is-json-draft' : ''
+              }`}
               onPointerDown={(event) => event.stopPropagation()}
               role="dialog"
             >
               <header>
                 <div>
-                  <strong>编辑 Value</strong>
+                  <strong>
+                    {valueEditor.scope === 'card' ? '编辑卡片' : '编辑 Value'}
+                  </strong>
                   <span>{valueEditor.keyLabel}</span>
                 </div>
                 <small>{valueEditor.type}</small>
               </header>
-              <textarea
-                autoFocus
-                className="value-editor-input"
-                onChange={(event) =>
-                  setValueEditor({
-                    ...valueEditor,
-                    draft: event.target.value,
-                    error: null,
-                  })
-                }
-                onKeyDown={(event) => {
-                  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                    event.preventDefault()
-                    saveEditedValue()
+              {isJsonDraft ? (
+                <JsonDraftEditor
+                  onChange={updateEditorDraft}
+                  onSubmit={saveEditedValue}
+                  value={valueEditor.draft}
+                />
+              ) : (
+                <textarea
+                  autoFocus
+                  className="value-editor-input"
+                  onChange={(event) =>
+                    updateEditorDraft(event.target.value)
                   }
-                }}
-                ref={valueEditorInputRef}
-                rows={1}
-                spellCheck={false}
-                value={valueEditor.draft}
-              />
+                  onKeyDown={(event) => {
+                    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                      event.preventDefault()
+                      saveEditedValue()
+                    }
+                  }}
+                  ref={valueEditorInputRef}
+                  rows={1}
+                  spellCheck={false}
+                  value={valueEditor.draft}
+                />
+              )}
               {valueEditor.error && (
                 <p className="value-editor-error">{valueEditor.error}</p>
               )}

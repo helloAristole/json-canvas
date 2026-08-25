@@ -10,12 +10,10 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
-import { json } from '@codemirror/lang-json'
 import { keymap, type EditorView, type ViewUpdate } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
 import { search } from '@codemirror/search'
-import { tags } from '@lezer/highlight'
+import { jsonLanguageExtensions } from './jsonHighlight'
 import {
   Braces,
   Check,
@@ -26,9 +24,8 @@ import {
   Clipboard,
   Copy,
   Download,
+  Eraser,
   KeyRound,
-  Maximize2,
-  Minimize2,
   Moon,
   PanelLeftClose,
   Plus,
@@ -366,6 +363,7 @@ export default function App() {
   const sourceSearchRef = useRef<SourceSearchHandle | null>(null)
   const sourceSearchOpenRef = useRef(false)
   const openSourceSearchRef = useRef<(withReplace?: boolean) => void>(() => {})
+  const clearSourceRef = useRef<() => void>(() => {})
   const [editorView, setEditorView] = useState<EditorView | null>(null)
   const [sourceSearchOpen, setSourceSearchOpen] = useState(false)
   const syncingSelectionRef = useRef(false)
@@ -575,6 +573,23 @@ export default function App() {
 
   useEffect(() => {
     if (!editorVisible) setSourceSearchOpen(false)
+  }, [editorVisible])
+
+  useEffect(() => {
+    if (!editorVisible) return
+
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented) return
+      if (!(event.ctrlKey || event.metaKey) || !event.shiftKey) return
+      if (event.key !== 'Backspace' && event.key !== 'Delete') return
+      const target = event.target as HTMLElement | null
+      if (target?.closest('input, textarea, select, .cm-editor')) return
+      event.preventDefault()
+      clearSourceRef.current()
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
   }, [editorVisible])
 
   useEffect(() => {
@@ -996,54 +1011,27 @@ export default function App() {
       selectedPath,
     ],
   )
+  const graphCollapsed = useMemo(() => {
+    const ids = collectContainerIds(jsonValue)
+    if (ids.size === 0) return false
+    for (const id of ids) {
+      if (!collapsedIds.has(id)) return false
+    }
+    return true
+  }, [collapsedIds, jsonValue])
+
+  const handleToggleGraphCollapse = useCallback(() => {
+    setPreserveViewportRequest((current) => current + 1)
+    setCollapsedIds(graphCollapsed ? new Set() : collectContainerIds(jsonValue))
+  }, [graphCollapsed, jsonValue])
+
   const stats = useMemo(() => getJsonStats(jsonValue), [jsonValue])
   const sourceBytes = useMemo(
     () => new TextEncoder().encode(source).byteLength,
     [source],
   )
   const jsonExtension = useMemo(
-    () => [
-      json(),
-      syntaxHighlighting(
-        HighlightStyle.define([
-          {
-            tag: tags.propertyName,
-            color: dark ? '#7dcfff' : '#287b9b',
-            fontWeight: '600',
-          },
-          {
-            tag: tags.string,
-            color: dark ? '#e0af68' : '#aa3f49',
-          },
-          {
-            tag: tags.number,
-            color: dark ? '#9ece6a' : '#16845b',
-          },
-          {
-            tag: tags.bool,
-            color: dark ? '#bb9af7' : '#7257f6',
-          },
-          {
-            tag: tags.null,
-            color: dark ? '#7a849e' : '#858b98',
-            fontStyle: 'italic',
-          },
-          {
-            tag: [tags.punctuation, tags.separator, tags.brace],
-            color: dark ? '#6d768a' : '#656c79',
-          },
-          {
-            tag: tags.escape,
-            color: dark ? '#e8c07a' : '#a87413',
-          },
-          {
-            tag: tags.invalid,
-            color: dark ? '#ff7f8c' : '#d44e62',
-            textDecoration: 'underline wavy',
-          },
-        ]),
-      ),
-    ],
+    () => jsonLanguageExtensions(dark),
     [dark],
   )
   const sourceSearchExtension = useMemo(
@@ -1066,6 +1054,24 @@ export default function App() {
             stopPropagation: true,
             run: () => {
               openSourceSearchRef.current(true)
+              return true
+            },
+          },
+          {
+            key: 'Mod-Shift-Backspace',
+            preventDefault: true,
+            stopPropagation: true,
+            run: () => {
+              clearSourceRef.current()
+              return true
+            },
+          },
+          {
+            key: 'Mod-Shift-Delete',
+            preventDefault: true,
+            stopPropagation: true,
+            run: () => {
+              clearSourceRef.current()
               return true
             },
           },
@@ -1245,6 +1251,18 @@ export default function App() {
     setSource(JSON.stringify(jsonValue, null, 2))
     showToast('已格式化')
   }
+
+  const sourceIsEmpty = source.trim() === '' || source.trim() === '{}'
+
+  const clearSource = useCallback(() => {
+    if (source.trim() === '' || source.trim() === '{}') return
+    setCollapsedIds(new Set())
+    setHiddenBranchIds(new Set())
+    handleSourceChange('{}')
+    showToast('已清空')
+  }, [handleSourceChange, showToast, source])
+
+  clearSourceRef.current = clearSource
 
   const createDocument = useCallback(() => {
     markWorkspaceEdited()
@@ -1553,6 +1571,16 @@ export default function App() {
                   格式化
                 </button>
                 <button
+                  className="panel-button"
+                  disabled={sourceIsEmpty}
+                  onClick={clearSource}
+                  title="清空 JSON (Ctrl+Shift+Backspace)"
+                  type="button"
+                >
+                  <Eraser size={14} />
+                  清空
+                </button>
+                <button
                   className="icon-button"
                   onClick={() => setEditorVisible(false)}
                   title="隐藏源码"
@@ -1635,38 +1663,6 @@ export default function App() {
         )}
 
         <section className="graph-panel">
-          <div className="panel-header graph-header">
-            <div className="panel-title graph-title">
-              <span>关系图</span>
-              <small>{graph.nodes.length} 个节点</small>
-            </div>
-
-            <div className="graph-tools">
-              <button
-                className="icon-button"
-                onClick={() => {
-                  setPreserveViewportRequest((current) => current + 1)
-                  setCollapsedIds(collectContainerIds(jsonValue))
-                }}
-                title="全部折叠"
-                type="button"
-              >
-                <Minimize2 size={16} />
-              </button>
-              <button
-                className="icon-button"
-                onClick={() => {
-                  setPreserveViewportRequest((current) => current + 1)
-                  setCollapsedIds(new Set())
-                }}
-                title="全部展开"
-                type="button"
-              >
-                <Maximize2 size={16} />
-              </button>
-            </div>
-          </div>
-
           {!editorVisible && (
             <button
               aria-label="显示源码"
@@ -1683,7 +1679,9 @@ export default function App() {
             dark={dark}
             definition={graph}
             focusRequest={focusRequest}
+            graphCollapsed={graphCollapsed}
             onClearSelection={clearSelection}
+            onToggleGraphCollapse={handleToggleGraphCollapse}
             onSearchChange={setSearchTerm}
             onSearchClose={() => {
               setSearchOpen(false)

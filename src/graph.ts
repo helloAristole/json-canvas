@@ -56,6 +56,7 @@ export interface JsonNodeData extends Record<string, unknown> {
   size: number
   keyColumnWidth: number
   collapsed: boolean
+  copyValue: string
   matched: boolean
   selectionState: 'normal' | 'selected' | 'dimmed'
   relationHoverState?: 'source' | 'target'
@@ -425,6 +426,7 @@ export function buildGraph(
     nodes.push({
       id,
       type: 'jsonCard',
+      className: 'nodrag nopan',
       position: { x: 0, y: 0 },
       data: {
         title,
@@ -435,6 +437,7 @@ export function buildGraph(
         size,
         keyColumnWidth,
         collapsed,
+        copyValue: copyValue(current),
         matched: nodeMatched || primitiveRows.some((row) => row.matched) || containerRows.some((row) => row.matched),
         selectionState,
         primitiveRows,

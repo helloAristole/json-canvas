@@ -11,10 +11,13 @@ import {
   type EdgeTypes,
   type NodeTypes,
 } from '@xyflow/react'
-import { Search } from 'lucide-react'
+import { Maximize2, Minimize2, Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { SearchPanel } from './SearchPanel'
-import { ReadOnlyJsonCardNode } from './ReadOnlyJsonCardNode'
+import {
+  openJsonCardEditor,
+  ReadOnlyJsonCardNode,
+} from './ReadOnlyJsonCardNode'
 import { getChannelOffset, NaturalEdge } from './NaturalEdge'
 import { pathToId, type JsonPath } from './json'
 import {
@@ -321,12 +324,14 @@ interface DiagramCanvasProps {
   definition: GraphDefinition
   dark: boolean
   focusRequest: FocusRequest | null
+  graphCollapsed: boolean
   onClearSelection: () => void
   onSearchChange: (value: string) => void
   onSearchClose: () => void
   onSearchIndexChange: (index: number) => void
   onSearchOpen: () => void
   onSelectEdge: (edgeId: string, sourcePath: JsonPath) => void
+  onToggleGraphCollapse: () => void
   preserveViewportRequest: number
   searchIndex: number
   searchOpen: boolean
@@ -340,12 +345,14 @@ function DiagramCanvas({
   definition,
   dark,
   focusRequest,
+  graphCollapsed,
   onClearSelection,
   onSearchChange,
   onSearchClose,
   onSearchIndexChange,
   onSearchOpen,
   onSelectEdge,
+  onToggleGraphCollapse,
   preserveViewportRequest,
   searchIndex,
   searchOpen,
@@ -449,8 +456,8 @@ function DiagramCanvas({
                   ? '#4fd4a8'
                   : '#27a978'
               : dark
-                ? '#6a7388'
-                : '#b8bbc2',
+                ? '#9a9aa2'
+                : '#8e949e',
             strokeDasharray:
               edgeSelected || edgeHovered ? '6 5' : undefined,
             strokeWidth: edgeSelected || edgeHovered ? 1.6 : 1,
@@ -745,13 +752,25 @@ function DiagramCanvas({
           }
           node.data.onSelect(node.data.path, node.data.path)
         }}
+        onNodeDoubleClick={(event, node) => {
+          event.stopPropagation()
+          const target = event.target as HTMLElement
+          if (
+            target.closest(
+              '.json-value, .json-node-row, .child-link, .node-icon-button, .row-source-handle',
+            )
+          ) {
+            return
+          }
+          openJsonCardEditor(node.id)
+        }}
         onNodesChange={onNodesChange}
         onPaneClick={onClearSelection}
         panOnScroll
         proOptions={{ hideAttribution: true }}
       >
         <Background
-          color={dark ? '#2c3344' : '#cbd2d9'}
+          color={dark ? '#3d3d42' : '#b7bdc6'}
           gap={16}
           size={1}
           variant={BackgroundVariant.Dots}
@@ -786,6 +805,20 @@ function DiagramCanvas({
               type="button"
             >
               <Search size={13} strokeWidth={2.2} />
+            </button>
+            <button
+              aria-label={graphCollapsed ? '全部展开' : '全部折叠'}
+              aria-pressed={graphCollapsed}
+              className="canvas-search-toggle"
+              onClick={onToggleGraphCollapse}
+              title={graphCollapsed ? '全部展开' : '全部折叠'}
+              type="button"
+            >
+              {graphCollapsed ? (
+                <Maximize2 size={13} strokeWidth={2.2} />
+              ) : (
+                <Minimize2 size={13} strokeWidth={2.2} />
+              )}
             </button>
             <Controls
               className="json-flow-controls"
