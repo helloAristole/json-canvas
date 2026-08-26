@@ -266,13 +266,15 @@ function rowMatches(
   query: string,
   key: string | number,
   value: JsonValue,
-  path: JsonPath,
 ): boolean {
   if (!query) return false
-  const haystack = `${String(key)} ${formatPath(path)} ${
-    isContainer(value) ? getValueType(value) : String(value)
-  }`.toLocaleLowerCase()
-  return haystack.includes(query)
+  if (String(key).toLocaleLowerCase().includes(query)) return true
+  if (isContainer(value)) return false
+  return String(value).toLocaleLowerCase().includes(query)
+}
+
+function searchableTitle(title: string): string {
+  return title.replace(/\[\d+\]/g, '')
 }
 
 export function buildGraph(
@@ -316,7 +318,7 @@ export function buildGraph(
     entries.forEach(([key, child], order) => {
       const isRootPrimitive = path.length === 0 && isLeafPrimitive
       const childPath = isLeafPrimitive || isRootPrimitive ? path : [...path, key]
-      const matched = rowMatches(query, key, child, childPath)
+      const matched = rowMatches(query, key, child)
       if (matched) {
         matches.push({
           keyLabel: String(key),
@@ -386,7 +388,7 @@ export function buildGraph(
     const pathLabel = formatPath(path)
     const nodeMatched =
       Boolean(query) &&
-      `${title} ${pathLabel} ${kind}`.toLocaleLowerCase().includes(query)
+      searchableTitle(title).toLocaleLowerCase().includes(query)
     const size = isContainer(current)
       ? Array.isArray(current)
         ? current.length

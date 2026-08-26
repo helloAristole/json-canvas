@@ -28,6 +28,13 @@ import {
   type JsonFlowNode,
 } from './graph'
 
+function eventElement(event: { target: EventTarget | null }): Element | null {
+  const target = event.target
+  if (target instanceof Element) return target
+  if (target instanceof Node) return target.parentElement
+  return null
+}
+
 const nodeTypes = {
   jsonCard: ReadOnlyJsonCardNode,
 } satisfies NodeTypes
@@ -333,6 +340,7 @@ interface DiagramCanvasProps {
   onSelectEdge: (edgeId: string, sourcePath: JsonPath) => void
   onToggleGraphCollapse: () => void
   preserveViewportRequest: number
+  searchFocusNonce: number
   searchIndex: number
   searchOpen: boolean
   searchTerm: string
@@ -354,6 +362,7 @@ function DiagramCanvas({
   onSelectEdge,
   onToggleGraphCollapse,
   preserveViewportRequest,
+  searchFocusNonce,
   searchIndex,
   searchOpen,
   searchTerm,
@@ -744,7 +753,7 @@ function DiagramCanvas({
         onNodeClick={(event, node) => {
           event.stopPropagation()
           if (
-            (event.target as HTMLElement).closest(
+            eventElement(event)?.closest(
               '.json-node-row, .node-icon-button, .child-link, .row-source-handle',
             )
           ) {
@@ -754,10 +763,9 @@ function DiagramCanvas({
         }}
         onNodeDoubleClick={(event, node) => {
           event.stopPropagation()
-          const target = event.target as HTMLElement
           if (
-            target.closest(
-              '.json-value, .json-node-row, .child-link, .node-icon-button, .row-source-handle',
+            eventElement(event)?.closest(
+              '.json-value, .json-node-row, .json-node-body, .child-link, .node-icon-button, .row-source-handle',
             )
           ) {
             return
@@ -778,6 +786,7 @@ function DiagramCanvas({
         {searchOpen && (
           <SearchPanel
             activeIndex={searchIndex}
+            focusNonce={searchFocusNonce}
             matches={definition.matches}
             onActiveIndexChange={onSearchIndexChange}
             onClose={onSearchClose}
@@ -801,7 +810,7 @@ function DiagramCanvas({
                 }
                 onSearchOpen()
               }}
-              title="搜索"
+              title="搜索 (Ctrl+F)"
               type="button"
             >
               <Search size={13} strokeWidth={2.2} />

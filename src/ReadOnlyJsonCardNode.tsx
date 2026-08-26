@@ -20,6 +20,9 @@ import { createPortal } from 'react-dom'
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 import { JsonDraftEditor } from './JsonDraftEditor'
 import {
+  getAtPath,
+  getValueType,
+  isContainer,
   parentCardPath,
   pathToId,
   type JsonPath,
@@ -76,6 +79,67 @@ function measureDraftWidth(draft: string): number {
     return Math.max(longest, units)
   }, 0)
   return Math.ceil(longestLine * 7.4 + 28)
+}
+
+const PREVIEW_FIELD_LIMIT = 8
+const PREVIEW_TEXT_LIMIT = 72
+
+interface PreviewField {
+  key: string
+  text: string
+  type: JsonValueType
+}
+
+function truncatePreview(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (compact.length <= PREVIEW_TEXT_LIMIT) return compact
+  return `${compact.slice(0, PREVIEW_TEXT_LIMIT - 1)}…`
+}
+
+function summarizeValue(value: JsonValue): PreviewField {
+  if (isContainer(value)) {
+    const size = Array.isArray(value) ? value.length : Object.keys(value).length
+    return {
+      key: '',
+      text: Array.isArray(value) ? `[${size} items]` : `{${size} keys}`,
+      type: Array.isArray(value) ? 'array' : 'object',
+    }
+  }
+  return {
+    key: '',
+    text: value === null ? 'null' : truncatePreview(String(value)),
+    type: value === null ? 'null' : (typeof value as JsonValueType),
+  }
+}
+
+function previewFields(value: JsonValue): PreviewField[] {
+  if (!isContainer(value)) return [summarizeValue(value)]
+
+  if (Array.isArray(value)) {
+    return value.slice(0, PREVIEW_FIELD_LIMIT).map((item, index) => {
+      const summary = summarizeValue(item)
+      return { ...summary, key: `[${index}]` }
+    })
+  }
+
+  return Object.entries(value)
+    .slice(0, PREVIEW_FIELD_LIMIT)
+    .map(([key, item]) => ({ ...summarizeValue(item), key }))
+}
+
+function childValueFromCard(
+  copyValue: string,
+  cardPath: JsonPath,
+  targetPath: JsonPath,
+): JsonValue | undefined {
+  try {
+    return getAtPath(
+      JSON.parse(copyValue) as JsonValue,
+      targetPath.slice(cardPath.length),
+    )
+  } catch {
+    return undefined
+  }
 }
 
 function childTargetsFromRows(rows: ContainerRow[]): NavTarget[] {
@@ -203,7 +267,6 @@ function ReadOnlyJsonCardNodeComponent({
     keyColumnWidth,
     collapsed,
     copyValue,
-    matched,
     selectionState,
     relationHoverState,
     hoveredSourcePathId,
@@ -229,10 +292,17 @@ function ReadOnlyJsonCardNodeComponent({
     left: 0,
     top: 0,
   })
+  const [hoveredChild, setHoveredChild] = useState<NavTarget | null>(null)
+  const [childPreviewStyle, setChildPreviewStyle] = useState<CSSProperties>({
+    left: 0,
+    top: 0,
+  })
   const [valueEditor, setValueEditor] = useState<ValueEditorState | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const gotoTriggerRef = useRef<HTMLButtonElement>(null)
   const gotoMenuRef = useRef<HTMLDivElement>(null)
+  const childPreviewRef = useRef<HTMLDivElement>(null)
+  const hoveredChildRectRef = useRef<DOMRect | null>(null)
   const gotoCloseTimerRef = useRef<number | null>(null)
   const valueEditorInputRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLElement>(null)
@@ -265,6 +335,7 @@ function ReadOnlyJsonCardNodeComponent({
     clearGotoCloseTimer()
     gotoCloseTimerRef.current = window.setTimeout(() => {
       setGotoOpen(false)
+      setHoveredChild(null)
       gotoCloseTimerRef.current = null
     }, 180)
   }
@@ -276,6 +347,7 @@ function ReadOnlyJsonCardNodeComponent({
       clearGotoCloseTimer()
       setContextMenu(null)
       setGotoOpen(false)
+      setHoveredChild(null)
     }
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') closeMenu()
@@ -284,6 +356,7 @@ function ReadOnlyJsonCardNodeComponent({
       const target = event.target as Node
       if (menuRef.current?.contains(target)) return
       if (gotoMenuRef.current?.contains(target)) return
+      if (childPreviewRef.current?.contains(target)) return
       closeMenu()
     }
 
@@ -316,6 +389,24 @@ function ReadOnlyJsonCardNodeComponent({
     }
     setGotoMenuStyle({ left, top, maxHeight })
   }, [childTargets.length, gotoOpen, primitiveRows.length])
+
+  useLayoutEffect(() => {
+    if (!hoveredChild || !gotoMenuRef.current) return
+    const flyout = gotoMenuRef.current.getBoundingClientRect()
+    const trigger = hoveredChildRectRef.current
+    const preview = childPreviewRef.current
+    const width = Math.max(preview?.offsetWidth ?? 240, 228)
+    const height = preview?.offsetHeight ?? 160
+    let left = flyout.right + 8
+    if (left + width > window.innerWidth - 8) {
+      left = Math.max(8, flyout.left - width - 8)
+    }
+    let top = trigger?.top ?? flyout.top
+    if (top + height > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - height - 8)
+    }
+    setChildPreviewStyle({ left, top, maxHeight: Math.min(320, window.innerHeight - 16) })
+  }, [hoveredChild])
 
   useEffect(() => {
     return () => {
@@ -409,12 +500,23 @@ function ReadOnlyJsonCardNodeComponent({
     onFocus(parentPath)
     setContextMenu(null)
     setGotoOpen(false)
+    setHoveredChild(null)
   }
 
   const focusNavTarget = (targetPath: JsonPath) => {
     onFocus(targetPath)
     setContextMenu(null)
     setGotoOpen(false)
+    setHoveredChild(null)
+  }
+
+  const hoverChildTarget = (
+    target: NavTarget,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) => {
+    clearGotoCloseTimer()
+    hoveredChildRectRef.current = event.currentTarget.getBoundingClientRect()
+    setHoveredChild(target)
   }
 
   const copyContextItem = (kind: 'key' | 'value') => {
@@ -501,6 +603,27 @@ function ReadOnlyJsonCardNodeComponent({
     )
   }
 
+  const hoveredChildValue = hoveredChild
+    ? childValueFromCard(copyValue, path, hoveredChild.path)
+    : undefined
+  const hoveredChildFields =
+    hoveredChildValue === undefined ? [] : previewFields(hoveredChildValue)
+  const hoveredChildTotal =
+    hoveredChildValue !== undefined && isContainer(hoveredChildValue)
+      ? Array.isArray(hoveredChildValue)
+        ? hoveredChildValue.length
+        : Object.keys(hoveredChildValue).length
+      : hoveredChildFields.length
+  const hoveredChildHidden = Math.max(0, hoveredChildTotal - hoveredChildFields.length)
+  const hoveredChildKind =
+    hoveredChildValue === undefined
+      ? ''
+      : isContainer(hoveredChildValue)
+        ? Array.isArray(hoveredChildValue)
+          ? `${hoveredChildTotal} items`
+          : `${hoveredChildTotal} keys`
+        : getValueType(hoveredChildValue)
+
   return (
     <>
       <article
@@ -508,9 +631,8 @@ function ReadOnlyJsonCardNodeComponent({
         className={`json-node nodrag nopan tone-${tone} ${
           selectionState === 'selected' ? 'is-selected' : ''
         } ${selectionState === 'dimmed' ? 'is-dimmed' : ''} ${
-          matched ? 'is-match' : ''
-        } ${relationHoverState === 'target' ? 'is-relation-target' : ''}`}
-        onDoubleClick={openCardEditor}
+          relationHoverState === 'target' ? 'is-relation-target' : ''
+        }`}
         ref={rootRef}
       >
       {!isRoot && (
@@ -846,8 +968,15 @@ function ReadOnlyJsonCardNodeComponent({
                     <span className="context-goto-label">Outgoing</span>
                     {childTargets.map((target) => (
                       <button
+                        className={
+                          hoveredChild &&
+                          pathToId(hoveredChild.path) === pathToId(target.path)
+                            ? 'is-previewed'
+                            : undefined
+                        }
                         key={`child-${pathToId(target.path)}`}
                         onClick={() => focusNavTarget(target.path)}
+                        onMouseEnter={(event) => hoverChildTarget(target, event)}
                         role="menuitem"
                         title={target.label}
                         type="button"
@@ -858,6 +987,51 @@ function ReadOnlyJsonCardNodeComponent({
                     ))}
                   </div>
                 ) : null}
+              </div>
+            ) : null}
+            {gotoOpen && hoveredChild && contextMenu.mode === 'card' ? (
+              <div
+                className="json-row-context-menu context-goto-preview"
+                onContextMenu={(event) => event.preventDefault()}
+                onMouseEnter={openGoto}
+                onMouseLeave={scheduleCloseGoto}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={childPreviewRef}
+                style={childPreviewStyle}
+              >
+                <div className="context-goto-preview-header">
+                  <strong title={hoveredChild.label}>{hoveredChild.label}</strong>
+                  {hoveredChildKind ? <span>{hoveredChildKind}</span> : null}
+                </div>
+                {hoveredChildFields.length === 0 ? (
+                  <div className="context-goto-preview-empty">暂无内容</div>
+                ) : (
+                  <div className="context-goto-props">
+                    {hoveredChildFields.map((field, index) => (
+                      <div
+                        className="context-goto-prop"
+                        key={`${field.key}-${index}`}
+                      >
+                        {field.key ? (
+                          <span className="context-goto-prop-key">
+                            {field.key}
+                          </span>
+                        ) : null}
+                        <span
+                          className={`context-goto-prop-value value-${field.type}`}
+                          title={field.text}
+                        >
+                          {field.text}
+                        </span>
+                      </div>
+                    ))}
+                    {hoveredChildHidden > 0 ? (
+                      <div className="context-goto-preview-more">
+                        还有 {hoveredChildHidden} 项
+                      </div>
+                    ) : null}
+                  </div>
+                )}
               </div>
             ) : null}
             </div>,

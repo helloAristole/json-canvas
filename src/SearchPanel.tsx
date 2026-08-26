@@ -27,6 +27,7 @@ function HighlightedText({
 
 export function SearchPanel({
   activeIndex,
+  focusNonce = 0,
   matches,
   onActiveIndexChange,
   onClose,
@@ -34,6 +35,7 @@ export function SearchPanel({
   query,
 }: {
   activeIndex: number
+  focusNonce?: number
   matches: SearchMatch[]
   onActiveIndexChange: (index: number) => void
   onClose: () => void
@@ -43,10 +45,17 @@ export function SearchPanel({
   const total = matches.length
   const current = total === 0 ? 0 : activeIndex + 1
   const activeItemRef = useRef<HTMLButtonElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     activeItemRef.current?.scrollIntoView({ block: 'nearest' })
   }, [activeIndex])
+
+  useEffect(() => {
+    if (focusNonce === 0) return
+    inputRef.current?.focus()
+    inputRef.current?.select()
+  }, [focusNonce])
 
   const move = (step: number) => {
     if (total === 0) return
@@ -64,6 +73,7 @@ export function SearchPanel({
           aria-label="搜索键、值或路径"
           autoFocus
           onChange={(event) => onQueryChange(event.target.value)}
+          ref={inputRef}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
               event.preventDefault()

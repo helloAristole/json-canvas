@@ -10,7 +10,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import CodeMirror from '@uiw/react-codemirror'
-import { keymap, type EditorView, type ViewUpdate } from '@codemirror/view'
+import { keymap, EditorView, type ViewUpdate } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
 import { search } from '@codemirror/search'
 import { jsonLanguageExtensions } from './jsonHighlight'
@@ -343,6 +343,7 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchIndex, setSearchIndex] = useState(0)
+  const [graphSearchFocusNonce, setGraphSearchFocusNonce] = useState(0)
   const [selectedPath, setSelectedPath] = useState<JsonPath | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
@@ -375,6 +376,10 @@ export default function App() {
   const selectionOriginRef = useRef<'graph' | 'editor' | null>(null)
   const workspaceRef = useRef<HTMLElement>(null)
   const sourcePanelRef = useRef<HTMLElement>(null)
+  const graphPanelRef = useRef<HTMLElement>(null)
+  const activePaneRef = useRef<'source' | 'graph'>(
+    editorVisible ? 'source' : 'graph',
+  )
   const resizePointerRef = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const toastTimerRef = useRef<number | null>(null)
@@ -397,6 +402,7 @@ export default function App() {
       anchor: number,
       head = anchor,
       scrollIntoView = false,
+      scrollTo?: number,
     ) => {
       const expectedSelection = { anchor, head }
       expectedEditorSelectionRef.current = expectedSelection
@@ -414,7 +420,16 @@ export default function App() {
       try {
         view.dispatch({
           selection: { anchor, head },
-          scrollIntoView,
+          ...(typeof scrollTo === 'number'
+            ? {
+                effects: EditorView.scrollIntoView(scrollTo, {
+                  x: 'start',
+                  xMargin: 12,
+                  y: 'center',
+                  yMargin: 0,
+                }),
+              }
+            : { scrollIntoView }),
         })
       } finally {
         syncingSelectionRef.current = false
@@ -552,11 +567,6 @@ export default function App() {
         changeEditorFontSize(EDITOR_FONT_DEFAULT)
         return
       }
-      if (event.key.toLowerCase() === 'f') {
-        event.preventDefault()
-        openSourceSearchRef.current(false)
-        return
-      }
       if (event.key.toLowerCase() === 'h') {
         event.preventDefault()
         openSourceSearchRef.current(true)
@@ -572,8 +582,66 @@ export default function App() {
   }, [changeEditorFontSize, editorVisible])
 
   useEffect(() => {
-    if (!editorVisible) setSourceSearchOpen(false)
+    if (!editorVisible) {
+      setSourceSearchOpen(false)
+      activePaneRef.current = 'graph'
+    }
   }, [editorVisible])
+
+  useEffect(() => {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+
+    const rememberPane = (event: Event) => {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      if (sourcePanelRef.current?.contains(target)) {
+        activePaneRef.current = 'source'
+        return
+      }
+      if (graphPanelRef.current?.contains(target)) {
+        activePaneRef.current = 'graph'
+      }
+    }
+
+    workspace.addEventListener('pointerdown', rememberPane, true)
+    workspace.addEventListener('focusin', rememberPane)
+    return () => {
+      workspace.removeEventListener('pointerdown', rememberPane, true)
+      workspace.removeEventListener('focusin', rememberPane)
+    }
+  }, [editorVisible])
+
+  const closeGraphSearch = useCallback(() => {
+    setSearchOpen(false)
+    setSearchTerm('')
+    setSearchIndex(0)
+  }, [])
+
+  const openGraphSearch = useCallback(() => {
+    setSourceSearchOpen(false)
+    setSearchOpen(true)
+    setGraphSearchFocusNonce((current) => current + 1)
+  }, [])
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.altKey || event.shiftKey) return
+      if (!event.ctrlKey && !event.metaKey) return
+      if (event.key.toLowerCase() !== 'f') return
+      event.preventDefault()
+      event.stopPropagation()
+      if (editorVisible && activePaneRef.current === 'source') {
+        closeGraphSearch()
+        openSourceSearchRef.current(false)
+        return
+      }
+      openGraphSearch()
+    }
+
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [closeGraphSearch, editorVisible, openGraphSearch])
 
   useEffect(() => {
     if (!editorVisible) return
@@ -663,11 +731,7 @@ export default function App() {
       return
     }
 
-    const range = locateJsonPath(
-      source,
-      selectedPath,
-      selectedNodeId !== pathToId(selectedPath),
-    )
+    const range = locateJsonPath(source, selectedPath, true)
     if (!range) {
       selectionOriginRef.current = null
       return
@@ -676,12 +740,11 @@ export default function App() {
     window.requestAnimationFrame(() => {
       if (selectionOriginRef.current !== 'graph') return
       selectionOriginRef.current = null
-      dispatchEditorSelection(view, range.from, range.to, true)
+      dispatchEditorSelection(view, range.from, range.to, false, range.from)
     })
   }, [
     dispatchEditorSelection,
     parseError,
-    selectedNodeId,
     selectedPath,
     source,
   ])
@@ -1662,7 +1725,7 @@ export default function App() {
           />
         )}
 
-        <section className="graph-panel">
+        <section className="graph-panel" ref={graphPanelRef}>
           {!editorVisible && (
             <button
               aria-label="显示源码"
@@ -1683,15 +1746,12 @@ export default function App() {
             onClearSelection={clearSelection}
             onToggleGraphCollapse={handleToggleGraphCollapse}
             onSearchChange={setSearchTerm}
-            onSearchClose={() => {
-              setSearchOpen(false)
-              setSearchTerm('')
-              setSearchIndex(0)
-            }}
+            onSearchClose={closeGraphSearch}
             onSearchIndexChange={activateSearchMatch}
-            onSearchOpen={() => setSearchOpen(true)}
+            onSearchOpen={openGraphSearch}
             onSelectEdge={handleSelectEdge}
             preserveViewportRequest={preserveViewportRequest}
+            searchFocusNonce={graphSearchFocusNonce}
             searchIndex={searchIndex}
             searchOpen={searchOpen}
             searchTerm={searchTerm}
