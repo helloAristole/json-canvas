@@ -91,6 +91,27 @@ export function formatPath(path: JsonPath): string {
   }, '$')
 }
 
+export function pathMatchesQuery(pathLabel: string, query: string): boolean {
+  const q = query.trim().toLocaleLowerCase()
+  const p = pathLabel.toLocaleLowerCase()
+  if (!q) return false
+
+  let needle = q
+  if (q === '$' || q.startsWith('$.') || q.startsWith('$[')) {
+    needle = q
+  } else if (q.startsWith('.')) {
+    needle = `$${q}`
+  } else if (q.includes('.') || q.includes('[')) {
+    needle = `$.${q}`
+  } else {
+    return false
+  }
+
+  if (needle === '$') return p === '$'
+
+  return p === needle || p.startsWith(`${needle}.`) || p.startsWith(`${needle}[`)
+}
+
 export function getAtPath(root: JsonValue, path: JsonPath): JsonValue {
   return path.reduce<JsonValue>((current, part) => {
     if (Array.isArray(current) && typeof part === 'number') return current[part]
@@ -225,6 +246,7 @@ export function getJsonStats(value: JsonValue): JsonStats {
   const visit = (current: JsonValue, depth: number) => {
     stats.values += 1
     stats.maxDepth = Math.max(stats.maxDepth, depth)
+    if (depth > 32) return
 
     if (Array.isArray(current)) {
       stats.arrays += 1

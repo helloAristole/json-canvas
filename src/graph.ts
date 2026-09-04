@@ -5,6 +5,7 @@ import {
   formatPath,
   getValueType,
   isContainer,
+  pathMatchesQuery,
   pathToId,
   type JsonPath,
   type JsonPrimitive,
@@ -24,6 +25,7 @@ export interface PrimitiveRow {
   isRoot: boolean
   matched: boolean
   selected: boolean
+  diff?: 'added' | 'changed'
   multiline: boolean
   height: number
   offsetY: number
@@ -43,6 +45,7 @@ export interface ContainerRow {
   isArrayItem: boolean
   matched: boolean
   selected: boolean
+  diff?: 'added' | 'changed'
   height: number
   offsetY: number
 }
@@ -57,7 +60,9 @@ export interface JsonNodeData extends Record<string, unknown> {
   keyColumnWidth: number
   collapsed: boolean
   copyValue: string
+  cardValue: JsonValue
   matched: boolean
+  diff?: 'added' | 'changed'
   selectionState: 'normal' | 'selected' | 'dimmed'
   relationHoverState?: 'source' | 'target'
   hoveredSourcePathId?: string
@@ -66,7 +71,7 @@ export interface JsonNodeData extends Record<string, unknown> {
   containerRows: ContainerRow[]
   onFocus: (path: JsonPath) => void
   onSelect: (sourcePath: JsonPath, nodePath: JsonPath) => void
-  onCopy: (text: string, kind: 'key' | 'value') => void
+  onCopy: (text: string, kind: 'key' | 'value' | 'path') => void
   onEditValue: (path: JsonPath, value: JsonValue) => void
   onToggle: (path: JsonPath) => void
   onToggleBranch: (path: JsonPath) => void
@@ -88,8 +93,13 @@ export interface SearchMatch {
   keyLabel: string
   nodeId: string
   path: JsonPath
+  pathLabel: string
   valueText: string
 }
+
+export const MAX_GRAPH_NODES = 280
+const MAX_GRAPH_DEPTH = 24
+const MAX_SEARCH_MATCHES = 300
 
 export interface GraphDefinition {
   nodes: JsonFlowNode[]
@@ -97,7 +107,7 @@ export interface GraphDefinition {
   signature: string
   matchCount: number
   matches: SearchMatch[]
-  dimUnselected: boolean
+  truncated: boolean
 }
 
 const NODE_WIDTH = 240
@@ -137,7 +147,8 @@ function neededValueWidth(value: JsonPrimitive): number {
 }
 
 function textPixelWidth(text: string): number {
-  return Array.from(text).reduce(
+  const sample = text.length > 160 ? text.slice(0, 160) : text
+  return Array.from(sample).reduce(
     (width, character) => width + charPixelWidth(character),
     0,
   )
@@ -222,9 +233,8 @@ function keyLabel(key: string | number, isRoot: boolean): string {
   return typeof key === 'number' ? `[${key}]` : key
 }
 
-function copyValue(value: JsonValue): string {
+function primitiveCopyValue(value: JsonPrimitive): string {
   if (typeof value === 'string') return value
-  if (isContainer(value)) return JSON.stringify(value, null, 2)
   return value === null ? 'null' : String(value)
 }
 
@@ -246,13 +256,6 @@ function getKeyColumnWidth(
   return Math.max(MIN_KEY_COLUMN_WIDTH, Math.ceil(longestKey * 6 + 8))
 }
 
-function pathsEqual(left: JsonPath, right: JsonPath): boolean {
-  return (
-    left.length === right.length &&
-    left.every((part, index) => part === right[index])
-  )
-}
-
 function branchTone(
   parentTone: NodeTone,
   index: number,
@@ -266,15 +269,33 @@ function rowMatches(
   query: string,
   key: string | number,
   value: JsonValue,
+  path: JsonPath,
 ): boolean {
   if (!query) return false
+  if (pathMatchesQuery(formatPath(path), query)) return true
   if (String(key).toLocaleLowerCase().includes(query)) return true
   if (isContainer(value)) return false
-  return String(value).toLocaleLowerCase().includes(query)
+  const text = value === null ? 'null' : String(value)
+  return text.length > 240
+    ? text.slice(0, 240).toLocaleLowerCase().includes(query)
+    : text.toLocaleLowerCase().includes(query)
 }
 
 function searchableTitle(title: string): string {
   return title.replace(/\[\d+\]/g, '')
+}
+
+function rowDiff(
+  diffByPath: Map<string, 'added' | 'changed'> | undefined,
+  path: JsonPath,
+): 'added' | 'changed' | undefined {
+  if (!diffByPath || diffByPath.size === 0) return undefined
+  for (let length = path.length; length >= 0; length -= 1) {
+    const kind = diffByPath.get(formatPath(path.slice(0, length)))
+    if (kind === 'added') return 'added'
+    if (kind === 'changed' && length === path.length) return 'changed'
+  }
+  return undefined
 }
 
 export function buildGraph(
@@ -283,15 +304,14 @@ export function buildGraph(
   hiddenBranchIds: Set<string>,
   searchTerm: string,
   rootTitle: string,
-  selectedPath: JsonPath | null,
-  selectedNodeId: string | null,
-  selectedEdgeId: string | null,
   actions: GraphActions,
+  diffByPath?: Map<string, 'added' | 'changed'>,
 ): GraphDefinition {
   const nodes: JsonFlowNode[] = []
   const edges: Edge[] = []
   const query = searchTerm.trim().toLocaleLowerCase()
   const matches: SearchMatch[] = []
+  let truncated = false
 
   const visit = (
     current: JsonValue,
@@ -303,6 +323,10 @@ export function buildGraph(
     sourceChannelIndex?: number,
     sourceChannelCount?: number,
   ) => {
+    if (nodes.length >= MAX_GRAPH_NODES || path.length > MAX_GRAPH_DEPTH) {
+      truncated = true
+      return
+    }
     const id = pathToId(path)
     const kind = getValueType(current)
     const collapsed = collapsedIds.has(id)
@@ -318,12 +342,13 @@ export function buildGraph(
     entries.forEach(([key, child], order) => {
       const isRootPrimitive = path.length === 0 && isLeafPrimitive
       const childPath = isLeafPrimitive || isRootPrimitive ? path : [...path, key]
-      const matched = rowMatches(query, key, child)
-      if (matched) {
+      const matched = rowMatches(query, key, child, childPath)
+      if (matched && matches.length < MAX_SEARCH_MATCHES) {
         matches.push({
           keyLabel: String(key),
           nodeId: id,
           path: childPath,
+          pathLabel: formatPath(childPath),
           valueText: isContainer(child)
             ? Array.isArray(child)
               ? `[${child.length} items]`
@@ -345,7 +370,7 @@ export function buildGraph(
         containerRows.push({
           keyLabel: keyLabel(key, false),
           copyKey: copyKeyForPath(childPath, String(key)),
-          copyValue: copyValue(child),
+          copyValue: '',
           order,
           path: childPath,
           focusPath: flattenedArray ? [...childPath, 0] : childPath,
@@ -355,10 +380,8 @@ export function buildGraph(
           expanded: !hiddenBranchIds.has(pathToId(childPath)),
           isArrayItem: typeof key === 'number',
           matched,
-          selected:
-            selectedNodeId === id &&
-            selectedPath !== null &&
-            pathsEqual(childPath, selectedPath),
+          selected: false,
+          diff: rowDiff(diffByPath, childPath),
           height: ROW_HEIGHT,
           offsetY: 0,
         })
@@ -366,7 +389,7 @@ export function buildGraph(
         primitiveRows.push({
           keyLabel: isLeafPrimitive ? '' : keyLabel(key, isRootPrimitive),
           copyKey: copyKeyForPath(childPath, String(key)),
-          copyValue: copyValue(child),
+          copyValue: primitiveCopyValue(child),
           order,
           path: childPath,
           value: child,
@@ -374,10 +397,8 @@ export function buildGraph(
           isArrayItem: typeof key === 'number',
           isRoot: isLeafPrimitive || isRootPrimitive,
           matched,
-          selected:
-            selectedNodeId === id &&
-            selectedPath !== null &&
-            pathsEqual(childPath, selectedPath),
+          selected: false,
+          diff: rowDiff(diffByPath, childPath),
           multiline: false,
           height: ROW_HEIGHT,
           offsetY: 0,
@@ -388,7 +409,8 @@ export function buildGraph(
     const pathLabel = formatPath(path)
     const nodeMatched =
       Boolean(query) &&
-      searchableTitle(title).toLocaleLowerCase().includes(query)
+      (pathMatchesQuery(pathLabel, query) ||
+        searchableTitle(title).toLocaleLowerCase().includes(query))
     const size = isContainer(current)
       ? Array.isArray(current)
         ? current.length
@@ -414,16 +436,6 @@ export function buildGraph(
       containerRows,
       valueColumnWidth,
     )
-    const nodeSelected = selectedNodeId === id
-    const rootNodeSelected =
-      selectedNodeId === 'json-root' &&
-      selectedPath !== null &&
-      selectedPath.length === 0
-    const selectionState = nodeSelected
-      ? 'selected'
-      : selectedNodeId !== null && !rootNodeSelected
-        ? 'dimmed'
-        : 'normal'
 
     nodes.push({
       id,
@@ -439,9 +451,11 @@ export function buildGraph(
         size,
         keyColumnWidth,
         collapsed,
-        copyValue: copyValue(current),
+        copyValue: '',
+        cardValue: current,
         matched: nodeMatched || primitiveRows.some((row) => row.matched) || containerRows.some((row) => row.matched),
-        selectionState,
+        diff: rowDiff(diffByPath, path),
+        selectionState: 'normal',
         primitiveRows,
         containerRows,
         ...actions,
@@ -511,50 +525,33 @@ export function buildGraph(
 
   visit(value, [], rootTitle || 'Untitled', 'cyan')
 
-  const selectedEdge = selectedEdgeId
-    ? edges.find((edge) => edge.id === selectedEdgeId)
-    : undefined
-  if (selectedEdge) {
-    const sourcePathId = selectedEdge.sourceHandle?.replace(/^source-/, '')
-    nodes.forEach((node) => {
-      const isEndpoint =
-        node.id === selectedEdge.source || node.id === selectedEdge.target
-      node.data = {
-        ...node.data,
-        selectionState: isEndpoint ? 'selected' : 'dimmed',
-        containerRows:
-          node.id === selectedEdge.source
-            ? node.data.containerRows.map((row) => ({
-                ...row,
-                selected: pathToId(row.path) === sourcePathId,
-              }))
-            : node.data.containerRows,
-      }
-    })
-  }
-
   const signature = `${nodes
     .map((node) => `${node.id}:${node.style?.width}x${node.style?.height}`)
     .join('|')}::${edges
     .map((edge) => `${edge.source}:${edge.sourceHandle ?? ''}>${edge.target}`)
     .join('|')}`
 
-  const dimUnselected =
-    Boolean(selectedEdge) ||
-    (selectedNodeId !== null &&
-      !(
-        selectedNodeId === 'json-root' &&
-        selectedPath !== null &&
-        selectedPath.length === 0
-      ))
+  const rankedMatches = [...matches].sort((left, right) => {
+    const needle = query.startsWith('$')
+      ? query
+      : query.startsWith('.')
+        ? `$${query}`
+        : query.includes('.') || query.includes('[')
+          ? `$.${query}`
+          : ''
+    if (!needle) return 0
+    const leftExact = left.pathLabel.toLocaleLowerCase() === needle ? 0 : 1
+    const rightExact = right.pathLabel.toLocaleLowerCase() === needle ? 0 : 1
+    return leftExact - rightExact
+  })
 
   return {
     nodes,
     edges,
     signature,
-    matchCount: matches.length,
-    matches,
-    dimUnselected,
+    matchCount: rankedMatches.length,
+    matches: rankedMatches,
+    truncated,
   }
 }
 

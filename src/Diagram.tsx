@@ -3,6 +3,7 @@ import {
   Background,
   BackgroundVariant,
   Controls,
+  getViewportForBounds,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -11,7 +12,8 @@ import {
   type EdgeTypes,
   type NodeTypes,
 } from '@xyflow/react'
-import { Maximize2, Minimize2, Search } from 'lucide-react'
+import { toPng } from 'html-to-image'
+import { ImageDown, Maximize2, Minimize2, Search } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { SearchPanel } from './SearchPanel'
 import {
@@ -33,6 +35,74 @@ function eventElement(event: { target: EventTarget | null }): Element | null {
   if (target instanceof Element) return target
   if (target instanceof Node) return target.parentElement
   return null
+}
+
+function pathsEqual(left: JsonPath, right: JsonPath): boolean {
+  return (
+    left.length === right.length &&
+    left.every((part, index) => part === right[index])
+  )
+}
+
+function applyNodeSelection(
+  node: JsonFlowNode,
+  selectedPath: JsonPath | null,
+  selectedNodeId: string | null,
+  selectedEdge: Edge | undefined,
+): JsonFlowNode {
+  const selectionState = selectedEdge
+    ? node.id === selectedEdge.source || node.id === selectedEdge.target
+      ? 'selected'
+      : 'dimmed'
+    : selectedNodeId === node.id
+      ? 'selected'
+      : selectedNodeId !== null &&
+          !(
+            selectedNodeId === 'json-root' &&
+            selectedPath !== null &&
+            selectedPath.length === 0
+          )
+        ? 'dimmed'
+        : 'normal'
+  const sourcePathId = selectedEdge?.sourceHandle?.replace(/^source-/, '')
+  let primitiveChanged = false
+  const primitiveRows = node.data.primitiveRows.map((row) => {
+    const selected =
+      !selectedEdge &&
+      selectedNodeId === node.id &&
+      selectedPath !== null &&
+      pathsEqual(row.path, selectedPath)
+    if (row.selected === selected) return row
+    primitiveChanged = true
+    return { ...row, selected }
+  })
+  let containerChanged = false
+  const containerRows = node.data.containerRows.map((row) => {
+    const selected = selectedEdge
+      ? node.id === selectedEdge.source && pathToId(row.path) === sourcePathId
+      : selectedNodeId === node.id &&
+        selectedPath !== null &&
+        pathsEqual(row.path, selectedPath)
+    if (row.selected === selected) return row
+    containerChanged = true
+    return { ...row, selected }
+  })
+  if (
+    node.data.selectionState === selectionState &&
+    !primitiveChanged &&
+    !containerChanged
+  ) {
+    return node
+  }
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      selectionState,
+      primitiveRows: primitiveChanged ? primitiveRows : node.data.primitiveRows,
+      containerRows: containerChanged ? containerRows : node.data.containerRows,
+    },
+  }
 }
 
 const nodeTypes = {
@@ -186,8 +256,10 @@ function orderEdgeGroups(groups: EdgeGroup[]): EdgeGroup[] {
     }
   }
 
-  return [...groups]
-    .sort((left, right) => right.sourceY - left.sourceY)
+  const sorted = [...groups].sort((left, right) => right.sourceY - left.sourceY)
+  if (count > 16) return sorted
+
+  return sorted
     .reduce<EdgeGroup[]>((ordered, group) => {
       let bestOrder = [...ordered, group]
       let bestCost = Number.POSITIVE_INFINITY
@@ -330,6 +402,7 @@ export interface FocusRequest {
 interface DiagramCanvasProps {
   definition: GraphDefinition
   dark: boolean
+  exportName: string
   focusRequest: FocusRequest | null
   graphCollapsed: boolean
   onClearSelection: () => void
@@ -338,6 +411,7 @@ interface DiagramCanvasProps {
   onSearchIndexChange: (index: number) => void
   onSearchOpen: () => void
   onSelectEdge: (edgeId: string, sourcePath: JsonPath) => void
+  onToast: (message: string) => void
   onToggleGraphCollapse: () => void
   preserveViewportRequest: number
   searchFocusNonce: number
@@ -346,12 +420,14 @@ interface DiagramCanvasProps {
   searchTerm: string
   selectedEdgeId: string | null
   selectedNodeId: string | null
+  selectedPath: JsonPath | null
   stale: boolean
 }
 
 function DiagramCanvas({
   definition,
   dark,
+  exportName,
   focusRequest,
   graphCollapsed,
   onClearSelection,
@@ -360,6 +436,7 @@ function DiagramCanvas({
   onSearchIndexChange,
   onSearchOpen,
   onSelectEdge,
+  onToast,
   onToggleGraphCollapse,
   preserveViewportRequest,
   searchFocusNonce,
@@ -368,6 +445,7 @@ function DiagramCanvas({
   searchTerm,
   selectedEdgeId,
   selectedNodeId,
+  selectedPath,
   stale,
 }: DiagramCanvasProps) {
   const [nodes, setNodes] = useState<JsonFlowNode[]>([])
@@ -385,8 +463,82 @@ function DiagramCanvas({
   const handledPreserveRequestRef = useRef(0)
   const nodesRef = useRef<JsonFlowNode[]>([])
   nodesRef.current = nodes
-  const { fitBounds, fitView, getViewport, setCenter, setViewport } =
-    useReactFlow<JsonFlowNode>()
+  const {
+    fitBounds,
+    fitView,
+    getNodes,
+    getNodesBounds,
+    getViewport,
+    setCenter,
+    setViewport,
+  } = useReactFlow<JsonFlowNode>()
+  const [exporting, setExporting] = useState(false)
+  const exportingRef = useRef(false)
+
+  const exportCanvasImage = useCallback(async () => {
+    if (exportingRef.current) return
+    const currentNodes = getNodes()
+    if (currentNodes.length === 0) {
+      onToast('画布为空，无法导出')
+      return
+    }
+
+    const viewportElement = document.querySelector(
+      '.graph-panel .react-flow__viewport',
+    )
+    if (!(viewportElement instanceof HTMLElement)) {
+      onToast('导出失败')
+      return
+    }
+
+    exportingRef.current = true
+    setExporting(true)
+    const previousTransform = viewportElement.style.transform
+    try {
+      const bounds = getNodesBounds(currentNodes)
+      const maxSide = 4096
+      let width = Math.max(720, Math.ceil(bounds.width + 80))
+      let height = Math.max(480, Math.ceil(bounds.height + 80))
+      const fit = Math.min(1, maxSide / width, maxSide / height)
+      width = Math.max(1, Math.round(width * fit))
+      height = Math.max(1, Math.round(height * fit))
+      const viewport = getViewportForBounds(
+        bounds,
+        width,
+        height,
+        0.2,
+        2,
+        0.12,
+      )
+      const dataUrl = await toPng(viewportElement, {
+        backgroundColor: dark ? '#1a1a1a' : '#e8eaee',
+        cacheBust: true,
+        height,
+        pixelRatio: 2,
+        width,
+        style: {
+          width: `${width}px`,
+          height: `${height}px`,
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`,
+        },
+      })
+      const anchor = document.createElement('a')
+      const safeName = (exportName.trim() || 'json-canvas').replace(
+        /[<>:"/\\|?*]+/g,
+        '_',
+      )
+      anchor.href = dataUrl
+      anchor.download = `${safeName}.png`
+      anchor.click()
+      onToast('画布已导出')
+    } catch {
+      onToast('导出失败')
+    } finally {
+      viewportElement.style.transform = previousTransform
+      exportingRef.current = false
+      setExporting(false)
+    }
+  }, [dark, exportName, getNodes, getNodesBounds, onToast])
 
   const reportNodeHeight = useCallback((id: string, height: number) => {
     const next = Math.ceil(height)
@@ -474,7 +626,12 @@ function DiagramCanvas({
               ? edgeSelected
                 ? 1
                 : 0.14
-              : selectedNodeId && definition.dimUnselected
+              : selectedNodeId &&
+                  !(
+                    selectedNodeId === 'json-root' &&
+                    selectedPath !== null &&
+                    selectedPath.length === 0
+                  )
                 ? edge.target === selectedNodeId
                   ? 0.44
                   : 0.16
@@ -485,23 +642,31 @@ function DiagramCanvas({
     },
     [
       dark,
-      definition.dimUnselected,
       definition.edges,
       edgeChannels,
       hoveredEdgeId,
       selectedEdgeId,
       selectedNodeId,
+      selectedPath,
     ],
   )
 
   const renderedNodes = useMemo<JsonFlowNode[]>(() => {
-    const withMeasure = (node: JsonFlowNode): JsonFlowNode => ({
-      ...node,
-      data: {
-        ...node.data,
-        onMeasuredHeight: reportNodeHeight,
-      },
-    })
+    const selectedEdge = selectedEdgeId
+      ? definition.edges.find((edge) => edge.id === selectedEdgeId)
+      : undefined
+    const withSelection = (node: JsonFlowNode): JsonFlowNode =>
+      applyNodeSelection(node, selectedPath, selectedNodeId, selectedEdge)
+    const withMeasure = (node: JsonFlowNode): JsonFlowNode => {
+      const selected = withSelection(node)
+      return {
+        ...selected,
+        data: {
+          ...selected.data,
+          onMeasuredHeight: reportNodeHeight,
+        },
+      }
+    }
     if (selectedEdgeId !== null || hoveredEdgeId === null) {
       return nodes.map(withMeasure)
     }
@@ -511,27 +676,31 @@ function DiagramCanvas({
     if (!hoveredEdge) return nodes.map(withMeasure)
 
     const sourcePathId = hoveredEdge.sourceHandle?.replace(/^source-/, '')
-    return nodes.map((node) => ({
-      ...withMeasure(node),
-      data: {
-        ...node.data,
-        onMeasuredHeight: reportNodeHeight,
-        relationHoverState:
-          node.id === hoveredEdge.target
-            ? 'target'
-            : node.id === hoveredEdge.source
-              ? 'source'
-              : undefined,
-        hoveredSourcePathId:
-          node.id === hoveredEdge.source ? sourcePathId : undefined,
-      },
-    }))
+    return nodes.map((node) => {
+      const measured = withMeasure(node)
+      return {
+        ...measured,
+        data: {
+          ...measured.data,
+          relationHoverState:
+            node.id === hoveredEdge.target
+              ? 'target'
+              : node.id === hoveredEdge.source
+                ? 'source'
+                : undefined,
+          hoveredSourcePathId:
+            node.id === hoveredEdge.source ? sourcePathId : undefined,
+        },
+      }
+    })
   }, [
     definition.edges,
     hoveredEdgeId,
     nodes,
     reportNodeHeight,
     selectedEdgeId,
+    selectedNodeId,
+    selectedPath,
   ])
 
   useEffect(() => {
@@ -733,6 +902,7 @@ function DiagramCanvas({
         nodes={renderedNodes}
         nodesConnectable={false}
         nodesDraggable={false}
+        onlyRenderVisibleElements
         elevateNodesOnSelect={false}
         onEdgeClick={(event, edge) => {
           event.stopPropagation()
@@ -829,6 +999,17 @@ function DiagramCanvas({
                 <Minimize2 size={13} strokeWidth={2.2} />
               )}
             </button>
+            <button
+              aria-busy={exporting}
+              aria-label="导出当前画布为图片"
+              className="canvas-search-toggle"
+              disabled={exporting}
+              onClick={() => void exportCanvasImage()}
+              title="导出画布为 PNG"
+              type="button"
+            >
+              <ImageDown size={13} strokeWidth={2.2} />
+            </button>
             <Controls
               className="json-flow-controls"
               fitViewOptions={{ duration: 400, padding: 0.24, maxZoom: 1.15 }}
@@ -851,6 +1032,11 @@ function DiagramCanvas({
           源码存在错误，画布保留上一次有效结果
         </div>
       )}
+      {!stale && definition.truncated ? (
+        <div className="canvas-message stale-message">
+          节点过多，仅展示前 {definition.nodes.length} 张卡片
+        </div>
+      ) : null}
     </div>
   )
 }

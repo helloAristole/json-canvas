@@ -134,7 +134,9 @@ export function SearchPanel({
                   ref={index === activeIndex ? activeItemRef : undefined}
                   type="button"
                 >
-                  <small>{match.keyLabel.toUpperCase()}</small>
+                  <small>
+                    <HighlightedText query={query.trim()} text={match.pathLabel} />
+                  </small>
                   <span>
                     <HighlightedText query={query.trim()} text={match.valueText} />
                   </span>

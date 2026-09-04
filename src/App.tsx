@@ -22,10 +22,14 @@ import {
   ChevronsRight,
   CircleAlert,
   Clipboard,
+  ClipboardPaste,
   Copy,
   Download,
   Eraser,
+  GitCompare,
+  History,
   KeyRound,
+  Link2,
   Moon,
   PanelLeftClose,
   Plus,
@@ -33,14 +37,29 @@ import {
   Sparkles,
   Sun,
   Upload,
+  X,
 } from 'lucide-react'
+import { parseClipboardJson } from './clipboardJson'
+import { ComparePanel } from './ComparePanel'
 import { Diagram, type FocusRequest } from './Diagram'
 import { buildGraph, type GraphActions } from './graph'
+import { HistoryPanel } from './HistoryPanel'
 import { findJsonPathAtOffset, locateJsonPath } from './jsonSource'
+import {
+  diffJson,
+  diffKindByPath,
+  parseJsonDocument,
+} from './jsonDiff'
+import {
+  loadHistory,
+  pushHistory,
+  removeHistory,
+} from './jsonHistory'
 import { SourceSearch, type SourceSearchHandle } from './SourceSearch'
 import {
   SAMPLE_JSON,
   copyKeyForPath,
+  formatPath,
   getAtPath,
   getJsonError,
   getJsonStats,
@@ -57,6 +76,7 @@ interface EditorContextMenu {
   copyKey: string
   copyValue: string
   keyLabel: string
+  pathLabel: string
   type: JsonValueType
   x: number
   y: number
@@ -134,6 +154,19 @@ interface InitialWorkspace extends StoredWorkspace {
   document: InitialDocument
 }
 
+function uniqueDocumentName(names: Iterable<string>, base: string): string {
+  const existing = new Set(names)
+  if (!existing.has(base)) return base
+  let suffix = 2
+  while (existing.has(`${base} ${suffix}`)) suffix += 1
+  return `${base} ${suffix}`
+}
+
+function isBlankJsonSource(source: string): boolean {
+  const trimmed = source.trim()
+  return trimmed === '' || trimmed === '{}' || trimmed === '[]'
+}
+
 function createDocumentId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID()
@@ -141,8 +174,23 @@ function createDocumentId(): string {
   return `json-view-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 }
 
+function utf8ByteLength(text: string): number {
+  let bytes = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    if (code <= 0x7f) bytes += 1
+    else if (code <= 0x7ff) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4
+      index += 1
+    } else bytes += 3
+  }
+  return bytes
+}
+
 function compactJsonIndentation(source: string): string {
   if (!source.trim()) return source
+  if (!/^\t/m.test(source) && !/^ {3,}/m.test(source)) return source
 
   try {
     JSON.parse(source)
@@ -315,7 +363,7 @@ function collectContainerIds(value: JsonValue): Set<string> {
   const ids = new Set<string>()
 
   const visit = (current: JsonValue, path: JsonPath) => {
-    if (!isContainer(current)) return
+    if (!isContainer(current) || path.length > 32) return
     ids.add(pathToId(path))
     const entries = Array.isArray(current)
       ? current.map((item, index) => [index, item] as const)
@@ -356,15 +404,21 @@ export default function App() {
   const [resizingSource, setResizingSource] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyEntries, setHistoryEntries] = useState(loadHistory)
+  const [compareOpen, setCompareOpen] = useState(false)
+  const [compareTargetId, setCompareTargetId] = useState<string | null>(null)
   const [editorContextMenu, setEditorContextMenu] =
     useState<EditorContextMenu | null>(null)
   const valueRef = useRef(jsonValue)
+  const parseErrorRef = useRef(initialDocument.error)
   const documentsRef = useRef(initialWorkspace.documents)
   const editorViewRef = useRef<EditorView | null>(null)
   const sourceSearchRef = useRef<SourceSearchHandle | null>(null)
   const sourceSearchOpenRef = useRef(false)
   const openSourceSearchRef = useRef<(withReplace?: boolean) => void>(() => {})
   const clearSourceRef = useRef<() => void>(() => {})
+  const openFromClipboardRef = useRef<() => void>(() => {})
   const [editorView, setEditorView] = useState<EditorView | null>(null)
   const [sourceSearchOpen, setSourceSearchOpen] = useState(false)
   const syncingSelectionRef = useRef(false)
@@ -382,6 +436,11 @@ export default function App() {
   )
   const resizePointerRef = useRef<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const historyMenuRef = useRef<HTMLDivElement>(null)
+  const compareMenuRef = useRef<HTMLDivElement>(null)
+  const historyTimerRef = useRef<number | null>(null)
+  const persistTimerRef = useRef<number | null>(null)
+  const jsonApplyTimerRef = useRef<number | null>(null)
   const toastTimerRef = useRef<number | null>(null)
   const dragDepthRef = useRef(0)
   const warnOnLeaveRef = useRef(false)
@@ -390,11 +449,61 @@ export default function App() {
     warnOnLeaveRef.current = true
   }, [])
 
+  const persistWorkspace = useCallback(() => {
+    const currentDocuments = documentsRef.current
+    const currentActiveId =
+      currentDocuments.find((document) => document.id === activeDocumentId)
+        ?.id ?? currentDocuments[0]?.id
+    const activeDocument =
+      currentDocuments.find((document) => document.id === currentActiveId) ??
+      currentDocuments[0]
+    if (!activeDocument || !currentActiveId) return
+
+    try {
+      window.localStorage.setItem(
+        WORKSPACE_STORAGE_KEY,
+        JSON.stringify({
+          activeDocumentId: currentActiveId,
+          documents: currentDocuments,
+        }),
+      )
+      window.localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          name: activeDocument.name,
+          source: activeDocument.source,
+        }),
+      )
+    } catch {
+      // Local storage can be unavailable in privacy-restricted contexts.
+    }
+  }, [activeDocumentId])
+
   const showToast = useCallback((message: string) => {
     setToast(message)
     if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
     toastTimerRef.current = window.setTimeout(() => setToast(null), 2200)
   }, [])
+
+  const recordSnapshot = useCallback(
+    (document: { id: string; name: string; source: string }) => {
+      const nextSource = document.source.trim() || '{}'
+      if (nextSource === '{}' || nextSource === '[]') return
+      try {
+        JSON.parse(nextSource)
+      } catch {
+        return
+      }
+      setHistoryEntries(
+        pushHistory({
+          documentId: document.id,
+          documentName: document.name,
+          source: nextSource,
+        }),
+      )
+    },
+    [],
+  )
 
   const dispatchEditorSelection = useCallback(
     (
@@ -687,30 +796,24 @@ export default function App() {
 
   useEffect(() => {
     documentsRef.current = documents
-    const activeDocument =
-      documents.find((document) => document.id === activeDocumentId) ??
-      documents[0]
-    if (!activeDocument) return
-
-    try {
-      window.localStorage.setItem(
-        WORKSPACE_STORAGE_KEY,
-        JSON.stringify({ activeDocumentId, documents }),
-      )
-      window.localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          name: activeDocument.name,
-          source: activeDocument.source,
-        }),
-      )
-    } catch {
-      // Local storage can be unavailable in privacy-restricted contexts.
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current)
     }
-  }, [activeDocumentId, documents])
+    persistTimerRef.current = window.setTimeout(() => {
+      persistWorkspace()
+      persistTimerRef.current = null
+    }, 450)
+    return () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current)
+        persistTimerRef.current = null
+      }
+    }
+  }, [activeDocumentId, documents, persistWorkspace])
 
   useEffect(() => {
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      persistWorkspace()
       if (!warnOnLeaveRef.current) return
       event.preventDefault()
       event.returnValue = ''
@@ -718,6 +821,14 @@ export default function App() {
 
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [persistWorkspace])
+
+  useEffect(() => {
+    return () => {
+      if (jsonApplyTimerRef.current !== null) {
+        window.clearTimeout(jsonApplyTimerRef.current)
+      }
+    }
   }, [])
 
   useEffect(() => {
@@ -763,14 +874,15 @@ export default function App() {
   const handleSourceChange = useCallback((nextSource: string) => {
     markWorkspaceEdited()
     const compactedSource = compactJsonIndentation(nextSource)
-    selectionOriginRef.current = null
-    setSelectedPath(null)
-    setSelectedNodeId(null)
-    setSelectedEdgeId(null)
     setSource(compactedSource)
     if (!compactedSource.trim()) {
+      if (jsonApplyTimerRef.current !== null) {
+        window.clearTimeout(jsonApplyTimerRef.current)
+        jsonApplyTimerRef.current = null
+      }
       const emptyValue: JsonValue = {}
       valueRef.current = emptyValue
+      parseErrorRef.current = null
       setJsonValue(emptyValue)
       setParseError(null)
       return
@@ -779,12 +891,71 @@ export default function App() {
     try {
       const nextValue = JSON.parse(compactedSource) as JsonValue
       valueRef.current = nextValue
-      setJsonValue(nextValue)
+      parseErrorRef.current = null
       setParseError(null)
+      if (jsonApplyTimerRef.current !== null) {
+        window.clearTimeout(jsonApplyTimerRef.current)
+      }
+      jsonApplyTimerRef.current = window.setTimeout(() => {
+        jsonApplyTimerRef.current = null
+        setJsonValue(nextValue)
+        selectionOriginRef.current = null
+        setSelectedPath(null)
+        setSelectedNodeId(null)
+        setSelectedEdgeId(null)
+      }, 140)
     } catch (error) {
-      setParseError(getJsonError(error))
+      const message = getJsonError(error)
+      parseErrorRef.current = message
+      setParseError(message)
     }
   }, [markWorkspaceEdited])
+
+  useEffect(() => {
+    if (parseError) return
+    if (historyTimerRef.current !== null) {
+      window.clearTimeout(historyTimerRef.current)
+    }
+    historyTimerRef.current = window.setTimeout(() => {
+      recordSnapshot({
+        id: activeDocumentId,
+        name: documentName,
+        source,
+      })
+      historyTimerRef.current = null
+    }, 2000)
+    return () => {
+      if (historyTimerRef.current !== null) {
+        window.clearTimeout(historyTimerRef.current)
+      }
+    }
+  }, [activeDocumentId, documentName, parseError, recordSnapshot, source])
+
+  useEffect(() => {
+    if (!historyOpen) return
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      if (historyMenuRef.current?.contains(event.target as Node)) return
+      setHistoryOpen(false)
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setHistoryOpen(false)
+    }
+    window.addEventListener('pointerdown', closeOnPointerDown)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('pointerdown', closeOnPointerDown)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [historyOpen])
+
+  useEffect(() => {
+    if (!compareOpen) return
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setCompareOpen(false)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [compareOpen])
 
   const activateDocument = useCallback((document: JsonViewDocument) => {
     const compactedSource = compactJsonIndentation(document.source)
@@ -804,6 +975,7 @@ export default function App() {
     if (!compactedSource.trim()) {
       const emptyValue: JsonValue = {}
       valueRef.current = emptyValue
+      parseErrorRef.current = null
       setJsonValue(emptyValue)
       setParseError(null)
       return
@@ -812,13 +984,16 @@ export default function App() {
     try {
       const nextValue = JSON.parse(compactedSource) as JsonValue
       valueRef.current = nextValue
+      parseErrorRef.current = null
       setJsonValue(nextValue)
       setParseError(null)
     } catch (error) {
       const emptyValue: JsonValue = {}
       valueRef.current = emptyValue
+      const message = getJsonError(error)
+      parseErrorRef.current = message
       setJsonValue(emptyValue)
-      setParseError(getJsonError(error))
+      setParseError(message)
     }
   }, [])
 
@@ -937,11 +1112,13 @@ export default function App() {
   }, [editorContextMenu])
 
   const handleCopyGraphItem = useCallback(
-    (text: string, kind: 'key' | 'value') => {
+    (text: string, kind: 'key' | 'value' | 'path') => {
       void (async () => {
         try {
           await navigator.clipboard.writeText(text)
-          showToast(`${kind === 'key' ? 'Key' : 'Value'} 已复制`)
+          showToast(
+            `${kind === 'key' ? 'Key' : kind === 'value' ? 'Value' : text} 已复制`,
+          )
         } catch {
           showToast('复制失败，请稍后重试')
         }
@@ -995,19 +1172,24 @@ export default function App() {
         copyKey: keyLabel,
         copyValue: formatCopyValue(value),
         keyLabel,
+        pathLabel: formatPath(location.path),
         type: getValueType(value),
         x: Math.max(8, Math.min(event.clientX, window.innerWidth - 176)),
-        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 120)),
+        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 156)),
       })
     },
     [documentName, jsonValue, parseError, selectedPath, showToast],
   )
 
   const copyEditorContextItem = useCallback(
-    (kind: 'key' | 'value') => {
+    (kind: 'key' | 'value' | 'path') => {
       if (!editorContextMenu) return
       handleCopyGraphItem(
-        kind === 'key' ? editorContextMenu.copyKey : editorContextMenu.copyValue,
+        kind === 'key'
+          ? editorContextMenu.copyKey
+          : kind === 'path'
+            ? editorContextMenu.pathLabel
+            : editorContextMenu.copyValue,
         kind,
       )
       setEditorContextMenu(null)
@@ -1023,6 +1205,7 @@ export default function App() {
       selectionOriginRef.current = null
       setJsonValue(nextJsonValue)
       setSource(JSON.stringify(nextJsonValue, null, 2))
+      parseErrorRef.current = null
       setParseError(null)
       setPreserveViewportRequest((current) => current + 1)
       showToast('Value 已更新')
@@ -1049,6 +1232,50 @@ export default function App() {
     ],
   )
 
+  const compareTargets = useMemo(
+    () =>
+      documents
+        .filter((document) => document.id !== activeDocumentId)
+        .map((document) => ({
+          id: document.id,
+          name: document.name || 'Untitled',
+        })),
+    [activeDocumentId, documents],
+  )
+
+  const compareLeftValue = useMemo(() => {
+    if (!compareOpen || !compareTargetId) return null
+    const target = documents.find((document) => document.id === compareTargetId)
+    if (!target) return null
+    return parseJsonDocument(target.source)
+  }, [compareOpen, compareTargetId, documents])
+
+  const compareDiffs = useMemo(() => {
+    if (!compareOpen || compareLeftValue === null) return []
+    return diffJson(compareLeftValue, jsonValue)
+  }, [compareOpen, compareLeftValue, jsonValue])
+
+  const diffByPath = useMemo(
+    () => (compareOpen ? diffKindByPath(compareDiffs) : undefined),
+    [compareDiffs, compareOpen],
+  )
+
+  useEffect(() => {
+    if (!compareOpen) return
+    if (compareTargets.length === 0) {
+      setCompareOpen(false)
+      setCompareTargetId(null)
+      return
+    }
+    if (
+      compareTargetId &&
+      compareTargets.some((target) => target.id === compareTargetId)
+    ) {
+      return
+    }
+    setCompareTargetId(compareTargets[0]?.id ?? null)
+  }, [compareOpen, compareTargetId, compareTargets])
+
   const graph = useMemo(
     () =>
       buildGraph(
@@ -1057,42 +1284,30 @@ export default function App() {
         hiddenBranchIds,
         searchTerm,
         documentName,
-        selectedPath,
-        selectedNodeId,
-        selectedEdgeId,
         graphActions,
+        diffByPath,
       ),
     [
       collapsedIds,
+      diffByPath,
       documentName,
       graphActions,
       hiddenBranchIds,
       jsonValue,
       searchTerm,
-      selectedEdgeId,
-      selectedNodeId,
-      selectedPath,
     ],
   )
-  const graphCollapsed = useMemo(() => {
-    const ids = collectContainerIds(jsonValue)
-    if (ids.size === 0) return false
-    for (const id of ids) {
-      if (!collapsedIds.has(id)) return false
-    }
-    return true
-  }, [collapsedIds, jsonValue])
+  const stats = useMemo(() => getJsonStats(jsonValue), [jsonValue])
+  const graphCollapsed =
+    stats.objects + stats.arrays > 0 &&
+    collapsedIds.size >= stats.objects + stats.arrays
 
   const handleToggleGraphCollapse = useCallback(() => {
     setPreserveViewportRequest((current) => current + 1)
     setCollapsedIds(graphCollapsed ? new Set() : collectContainerIds(jsonValue))
   }, [graphCollapsed, jsonValue])
 
-  const stats = useMemo(() => getJsonStats(jsonValue), [jsonValue])
-  const sourceBytes = useMemo(
-    () => new TextEncoder().encode(source).byteLength,
-    [source],
-  )
+  const sourceBytes = useMemo(() => utf8ByteLength(source), [source])
   const jsonExtension = useMemo(
     () => jsonLanguageExtensions(dark),
     [dark],
@@ -1191,6 +1406,7 @@ export default function App() {
       if (update.docChanged || !update.selectionSet) {
         return
       }
+      if (parseErrorRef.current) return
 
       const selection = update.state.selection.main
       const expectedSelection = expectedEditorSelectionRef.current
@@ -1348,6 +1564,170 @@ export default function App() {
     activateDocument(nextDocument)
   }, [activateDocument, markWorkspaceEdited, snapshotActiveDocument])
 
+  const restoreHistoryEntry = useCallback(
+    (entry: { documentName: string; source: string }) => {
+      markWorkspaceEdited()
+      const currentDocuments = snapshotActiveDocument()
+      const existingNames = new Set(
+        currentDocuments.map((document) => document.name),
+      )
+      const baseName = entry.documentName.trim() || 'Untitled'
+      let name = baseName
+      let suffix = 2
+      while (existingNames.has(name)) {
+        name = `${baseName} ${suffix}`
+        suffix += 1
+      }
+
+      const nextDocument: JsonViewDocument = {
+        id: createDocumentId(),
+        name,
+        source: entry.source,
+      }
+      const nextDocuments = [...currentDocuments, nextDocument]
+      documentsRef.current = nextDocuments
+      setDocuments(nextDocuments)
+      setActiveDocumentId(nextDocument.id)
+      activateDocument(nextDocument)
+      setHistoryOpen(false)
+      showToast(`已恢复到「${name}」`)
+    },
+    [activateDocument, markWorkspaceEdited, showToast, snapshotActiveDocument],
+  )
+
+  const openFromClipboard = useCallback(async () => {
+    let text = ''
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('unsupported')
+      }
+      text = await Promise.race([
+        navigator.clipboard.readText(),
+        new Promise<string>((_, reject) => {
+          window.setTimeout(() => reject(new Error('timeout')), 8000)
+        }),
+      ])
+    } catch {
+      showToast('无法读取剪贴板')
+      return
+    }
+
+    const parsed = parseClipboardJson(text)
+    if (!parsed) {
+      showToast(text.trim() ? '剪贴板中没有有效 JSON' : '剪贴板为空')
+      return
+    }
+
+    const nextSource = compactJsonIndentation(parsed.source)
+    const toast = parsed.extracted
+      ? '已从剪贴板提取 JSON'
+      : '已从剪贴板打开'
+
+    markWorkspaceEdited()
+    const currentDocuments = snapshotActiveDocument()
+
+    if (isBlankJsonSource(source)) {
+      const keepName =
+        documentName.trim() !== '' && documentName !== 'Untitled'
+      setDocumentName(
+        keepName
+          ? documentName
+          : uniqueDocumentName(
+              currentDocuments
+                .filter((document) => document.id !== activeDocumentId)
+                .map((document) => document.name),
+              'Clipboard',
+            ),
+      )
+      handleSourceChange(nextSource)
+      showToast(toast)
+      return
+    }
+
+    const nextDocument: JsonViewDocument = {
+      id: createDocumentId(),
+      name: uniqueDocumentName(
+        currentDocuments.map((document) => document.name),
+        'Clipboard',
+      ),
+      source: nextSource,
+    }
+    const nextDocuments = [...currentDocuments, nextDocument]
+    documentsRef.current = nextDocuments
+    setDocuments(nextDocuments)
+    setActiveDocumentId(nextDocument.id)
+    activateDocument(nextDocument)
+    showToast(toast)
+  }, [
+    activateDocument,
+    activeDocumentId,
+    documentName,
+    handleSourceChange,
+    markWorkspaceEdited,
+    showToast,
+    snapshotActiveDocument,
+    source,
+  ])
+
+  openFromClipboardRef.current = () => {
+    void openFromClipboard()
+  }
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.repeat || event.altKey || event.isComposing) return
+      if (!(event.ctrlKey || event.metaKey) || !event.shiftKey) return
+      if (event.key.toLowerCase() !== 'v') return
+      event.preventDefault()
+      event.stopPropagation()
+      openFromClipboardRef.current()
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+
+  const closeDocument = useCallback(
+    (documentId: string) => {
+      markWorkspaceEdited()
+      const currentDocuments = snapshotActiveDocument()
+      const index = currentDocuments.findIndex(
+        (document) => document.id === documentId,
+      )
+      if (index < 0) return
+
+      const closing = currentDocuments[index]
+      recordSnapshot({
+        id: closing.id,
+        name: closing.name,
+        source: closing.source,
+      })
+
+      let nextDocuments = currentDocuments.filter(
+        (document) => document.id !== documentId,
+      )
+      if (nextDocuments.length === 0) {
+        nextDocuments = [
+          {
+            id: createDocumentId(),
+            name: 'Untitled',
+            source: '{}',
+          },
+        ]
+      }
+
+      documentsRef.current = nextDocuments
+      setDocuments(nextDocuments)
+
+      if (documentId !== activeDocumentId) return
+
+      const fallback =
+        nextDocuments[Math.min(index, nextDocuments.length - 1)]
+      setActiveDocumentId(fallback.id)
+      activateDocument(fallback)
+    },
+    [activateDocument, activeDocumentId, markWorkspaceEdited, recordSnapshot, snapshotActiveDocument],
+  )
+
   const loadFile = useCallback(
     async (file: File) => {
       if (!file.name.toLocaleLowerCase().endsWith('.json')) {
@@ -1423,6 +1803,16 @@ export default function App() {
     }
   }, [clearDragActive, loadFile])
 
+  const openCompare = useCallback(() => {
+    if (compareTargets.length === 0) {
+      setCompareOpen(false)
+      showToast('请再打开一个 JSON 再对比')
+      return
+    }
+    setHistoryOpen(false)
+    setCompareOpen((open) => !open)
+  }, [compareTargets.length, showToast])
+
   const downloadFile = () => {
     if (parseError) {
       showToast('无效 JSON 无法导出')
@@ -1472,6 +1862,12 @@ export default function App() {
                   active && parseError ? 'is-invalid' : ''
                 }`}
                 key={document.id}
+                onAuxClick={(event) => {
+                  if (event.button !== 1) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  closeDocument(document.id)
+                }}
                 onClick={() => switchDocument(document.id)}
                 onKeyDown={(event) => {
                   if (
@@ -1501,6 +1897,20 @@ export default function App() {
                     {document.name || 'Untitled'}
                   </span>
                 )}
+                <button
+                  aria-label={`关闭 ${document.name || 'Untitled'}`}
+                  className="document-close"
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    closeDocument(document.id)
+                  }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  title="关闭"
+                  type="button"
+                >
+                  <X size={10} strokeWidth={2} />
+                </button>
               </div>
             )
           })}
@@ -1529,12 +1939,55 @@ export default function App() {
           >
             <Upload size={17} />
           </button>
+          <button
+            className="toolbar-button"
+            onClick={() => void openFromClipboard()}
+            title="从剪贴板打开 (Ctrl+Shift+V)"
+            type="button"
+          >
+            <ClipboardPaste size={17} />
+          </button>
           <button className="toolbar-button" onClick={downloadFile} title="下载" type="button">
             <Download size={17} />
           </button>
+          <div className="history-menu" ref={historyMenuRef}>
+            <button
+              aria-expanded={historyOpen}
+              aria-haspopup="dialog"
+              className={`toolbar-button ${historyOpen ? 'is-active' : ''}`}
+              onClick={() => {
+                setCompareOpen(false)
+                setHistoryOpen((open) => !open)
+              }}
+              title="历史记录"
+              type="button"
+            >
+              <History size={17} />
+            </button>
+            {historyOpen ? (
+              <HistoryPanel
+                entries={historyEntries}
+                onClose={() => setHistoryOpen(false)}
+                onDelete={(id) => setHistoryEntries(removeHistory(id))}
+                onRestore={restoreHistoryEntry}
+              />
+            ) : null}
+          </div>
+          <div className="history-menu" ref={compareMenuRef}>
+            <button
+              aria-expanded={compareOpen}
+              aria-haspopup="dialog"
+              className={`toolbar-button ${compareOpen ? 'is-active' : ''}`}
+              onClick={openCompare}
+              title="版本对比"
+              type="button"
+            >
+              <GitCompare size={17} />
+            </button>
+          </div>
           <span className="toolbar-divider" />
           <button
-            className="toolbar-button"
+            className="toolbar-button theme-toggle"
             onClick={() => setDark((current) => !current)}
             title={dark ? '切换到浅色' : '切换到深色'}
             type="button"
@@ -1555,6 +2008,24 @@ export default function App() {
           type="file"
         />
       </header>
+
+      {compareOpen && compareTargetId && compareTargets.length > 0 ? (
+        <ComparePanel
+          currentName={documentName || 'Untitled'}
+          diffs={compareDiffs}
+          leftValue={compareLeftValue}
+          onClose={() => setCompareOpen(false)}
+          onFocus={(path) => {
+            setCompareOpen(false)
+            handleFocus(cardPathForSelection(jsonValue, path))
+            setSelectedPath(path)
+          }}
+          onSelectTarget={setCompareTargetId}
+          rightValue={jsonValue}
+          targetId={compareTargetId}
+          targets={compareTargets}
+        />
+      ) : null}
 
       <main
         className={`workspace ${editorVisible ? '' : 'editor-hidden'} ${
@@ -1750,6 +2221,8 @@ export default function App() {
             onSearchIndexChange={activateSearchMatch}
             onSearchOpen={openGraphSearch}
             onSelectEdge={handleSelectEdge}
+            onToast={showToast}
+            exportName={documentName}
             preserveViewportRequest={preserveViewportRequest}
             searchFocusNonce={graphSearchFocusNonce}
             searchIndex={searchIndex}
@@ -1757,6 +2230,7 @@ export default function App() {
             searchTerm={searchTerm}
             selectedEdgeId={selectedEdgeId}
             selectedNodeId={selectedNodeId}
+            selectedPath={selectedPath}
             stale={Boolean(parseError)}
           />
         </section>
@@ -1791,6 +2265,9 @@ export default function App() {
               <strong title={editorContextMenu.keyLabel}>
                 {editorContextMenu.keyLabel}
               </strong>
+              <code title={editorContextMenu.pathLabel}>
+                {editorContextMenu.pathLabel}
+              </code>
               <span>{editorContextMenu.type}</span>
             </div>
             <button
@@ -1809,6 +2286,14 @@ export default function App() {
             >
               <KeyRound size={13} />
               <span>复制 Key</span>
+            </button>
+            <button
+              onClick={() => copyEditorContextItem('path')}
+              role="menuitem"
+              type="button"
+            >
+              <Link2 size={13} />
+              <span>复制路径</span>
             </button>
           </div>,
           document.body,

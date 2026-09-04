@@ -14,6 +14,7 @@ import {
   CornerDownRight,
   CornerLeftUp,
   KeyRound,
+  Link2,
   Pencil,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
@@ -22,6 +23,7 @@ import { JsonDraftEditor } from './JsonDraftEditor'
 import {
   getAtPath,
   getValueType,
+  formatPath,
   isContainer,
   parentCardPath,
   pathToId,
@@ -83,6 +85,87 @@ function measureDraftWidth(draft: string): number {
 
 const PREVIEW_FIELD_LIMIT = 8
 const PREVIEW_TEXT_LIMIT = 72
+const GOTO_ITEM_LIMIT = 24
+
+function nonemptyContainer(value: JsonValue): value is JsonValue & object {
+  return (
+    isContainer(value) &&
+    (Array.isArray(value) ? value.length > 0 : Object.keys(value).length > 0)
+  )
+}
+
+function outgoingCardTargets(
+  value: JsonValue | undefined,
+  basePath: JsonPath,
+): NavTarget[] {
+  if (value === undefined || !isContainer(value)) return []
+
+  const flattenItems = (
+    items: JsonValue[],
+    prefix: string,
+    itemBase: JsonPath,
+  ): NavTarget[] =>
+    items.map((_, index) => ({
+      label: prefix ? `${prefix}[${index}]` : `[${index}]`,
+      path: [...itemBase, index] as JsonPath,
+    }))
+
+  if (Array.isArray(value)) {
+    if (value.length > 0 && value.every((item) => isContainer(item))) {
+      return flattenItems(value, '', basePath)
+    }
+    return value.flatMap((item, index) => {
+      if (!nonemptyContainer(item)) return []
+      const itemPath = [...basePath, index] as JsonPath
+      if (
+        Array.isArray(item) &&
+        item.length > 0 &&
+        item.every((nested) => isContainer(nested))
+      ) {
+        return flattenItems(item, `[${index}]`, itemPath)
+      }
+      return [{ label: `[${index}]`, path: itemPath }]
+    })
+  }
+
+  return Object.entries(value).flatMap(([key, child]) => {
+    if (!nonemptyContainer(child)) return []
+    const childPath = [...basePath, key] as JsonPath
+    if (
+      Array.isArray(child) &&
+      child.length > 0 &&
+      child.every((item) => isContainer(item))
+    ) {
+      return flattenItems(child, key, childPath)
+    }
+    return [{ label: key, path: childPath }]
+  })
+}
+
+function uniqueNavTargets(targets: NavTarget[]): NavTarget[] {
+  const seen = new Set<string>()
+  return targets.filter((target) => {
+    const id = pathToId(target.path)
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
+
+function rowNavTargets(
+  row: ContainerRow,
+  cardValue: JsonValue,
+  cardPath: JsonPath,
+): NavTarget[] {
+  if (!row.linked) return []
+  return uniqueNavTargets([
+    ...childTargetsFromRows([row]),
+    ...outgoingCardTargets(
+      childValueFromCard(cardValue, cardPath, row.path),
+      row.path,
+    ),
+  ]).slice(0, GOTO_ITEM_LIMIT)
+}
 
 interface PreviewField {
   key: string
@@ -127,16 +210,29 @@ function previewFields(value: JsonValue): PreviewField[] {
     .map(([key, item]) => ({ ...summarizeValue(item), key }))
 }
 
+function stringifyJsonValue(value: JsonValue): string {
+  if (typeof value === 'string') return value
+  if (isContainer(value)) return JSON.stringify(value, null, 2)
+  return value === null ? 'null' : String(value)
+}
+
+function rowCopyText(
+  row: CopyableRow,
+  cardValue: JsonValue,
+  cardPath: JsonPath,
+): string {
+  if (row.copyValue) return row.copyValue
+  const value = childValueFromCard(cardValue, cardPath, row.path)
+  return value === undefined ? '' : stringifyJsonValue(value)
+}
+
 function childValueFromCard(
-  copyValue: string,
+  cardValue: JsonValue,
   cardPath: JsonPath,
   targetPath: JsonPath,
 ): JsonValue | undefined {
   try {
-    return getAtPath(
-      JSON.parse(copyValue) as JsonValue,
-      targetPath.slice(cardPath.length),
-    )
+    return getAtPath(cardValue, targetPath.slice(cardPath.length))
   } catch {
     return undefined
   }
@@ -193,11 +289,6 @@ function parseEditedValue(
       error: type === 'object' || type === 'array' ? 'JSON 格式不正确' : 'Value 格式不正确',
     }
   }
-}
-
-function previewPrimitive(value: JsonPrimitive): string {
-  if (value === null) return 'null'
-  return String(value)
 }
 
 function StaticKey({
@@ -266,8 +357,9 @@ function ReadOnlyJsonCardNodeComponent({
     tone,
     keyColumnWidth,
     collapsed,
-    copyValue,
+    cardValue,
     selectionState,
+    diff: cardDiff,
     relationHoverState,
     hoveredSourcePathId,
     primitiveRows,
@@ -285,7 +377,12 @@ function ReadOnlyJsonCardNodeComponent({
   const parentPath = parentCardPath(path)
   const childTargets = childTargetsFromRows(containerRows)
   const hasParent = parentPath !== null
-  const canGoto = childTargets.length > 0 || primitiveRows.length > 0
+  const canGoto = childTargets.length > 0
+  const childHasGrandchildren = (target: NavTarget) =>
+    outgoingCardTargets(
+      childValueFromCard(cardValue, path, target.path),
+      target.path,
+    ).length > 0
   const [contextMenu, setContextMenu] = useState<RowContextMenu | null>(null)
   const [gotoOpen, setGotoOpen] = useState(false)
   const [gotoMenuStyle, setGotoMenuStyle] = useState<CSSProperties>({
@@ -293,16 +390,26 @@ function ReadOnlyJsonCardNodeComponent({
     top: 0,
   })
   const [hoveredChild, setHoveredChild] = useState<NavTarget | null>(null)
+  const [hoveredGrandchild, setHoveredGrandchild] = useState<NavTarget | null>(
+    null,
+  )
   const [childPreviewStyle, setChildPreviewStyle] = useState<CSSProperties>({
     left: 0,
     top: 0,
   })
+  const [grandchildPreviewStyle, setGrandchildPreviewStyle] =
+    useState<CSSProperties>({
+      left: 0,
+      top: 0,
+    })
   const [valueEditor, setValueEditor] = useState<ValueEditorState | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const gotoTriggerRef = useRef<HTMLButtonElement>(null)
   const gotoMenuRef = useRef<HTMLDivElement>(null)
   const childPreviewRef = useRef<HTMLDivElement>(null)
+  const grandchildPreviewRef = useRef<HTMLDivElement>(null)
   const hoveredChildRectRef = useRef<DOMRect | null>(null)
+  const hoveredGrandchildRectRef = useRef<DOMRect | null>(null)
   const gotoCloseTimerRef = useRef<number | null>(null)
   const valueEditorInputRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLElement>(null)
@@ -336,6 +443,7 @@ function ReadOnlyJsonCardNodeComponent({
     gotoCloseTimerRef.current = window.setTimeout(() => {
       setGotoOpen(false)
       setHoveredChild(null)
+      setHoveredGrandchild(null)
       gotoCloseTimerRef.current = null
     }, 180)
   }
@@ -348,15 +456,25 @@ function ReadOnlyJsonCardNodeComponent({
       setContextMenu(null)
       setGotoOpen(false)
       setHoveredChild(null)
+      setHoveredGrandchild(null)
     }
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') closeMenu()
     }
-    const closeOnPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node
-      if (menuRef.current?.contains(target)) return
-      if (gotoMenuRef.current?.contains(target)) return
-      if (childPreviewRef.current?.contains(target)) return
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      const target = event.target
+      if (
+        target instanceof Element &&
+        target.closest('.json-row-context-menu')
+      ) {
+        return
+      }
+      if (target instanceof Node) {
+        if (menuRef.current?.contains(target)) return
+        if (gotoMenuRef.current?.contains(target)) return
+        if (childPreviewRef.current?.contains(target)) return
+        if (grandchildPreviewRef.current?.contains(target)) return
+      }
       closeMenu()
     }
 
@@ -388,7 +506,7 @@ function ReadOnlyJsonCardNodeComponent({
       top = Math.max(8, window.innerHeight - Math.min(menuHeight, maxHeight) - 8)
     }
     setGotoMenuStyle({ left, top, maxHeight })
-  }, [childTargets.length, gotoOpen, primitiveRows.length])
+  }, [childTargets.length, contextMenu?.mode, gotoOpen])
 
   useLayoutEffect(() => {
     if (!hoveredChild || !gotoMenuRef.current) return
@@ -405,8 +523,30 @@ function ReadOnlyJsonCardNodeComponent({
     if (top + height > window.innerHeight - 8) {
       top = Math.max(8, window.innerHeight - height - 8)
     }
-    setChildPreviewStyle({ left, top, maxHeight: Math.min(320, window.innerHeight - 16) })
+    setChildPreviewStyle({ left, top, maxHeight: Math.min(400, window.innerHeight - 16) })
   }, [hoveredChild])
+
+  useLayoutEffect(() => {
+    if (!hoveredGrandchild || !childPreviewRef.current) return
+    const flyout = childPreviewRef.current.getBoundingClientRect()
+    const trigger = hoveredGrandchildRectRef.current
+    const preview = grandchildPreviewRef.current
+    const width = Math.max(preview?.offsetWidth ?? 240, 228)
+    const height = preview?.offsetHeight ?? 160
+    let left = flyout.right + 8
+    if (left + width > window.innerWidth - 8) {
+      left = Math.max(8, flyout.left - width - 8)
+    }
+    let top = trigger?.top ?? flyout.top
+    if (top + height > window.innerHeight - 8) {
+      top = Math.max(8, window.innerHeight - height - 8)
+    }
+    setGrandchildPreviewStyle({
+      left,
+      top,
+      maxHeight: Math.min(400, window.innerHeight - 16),
+    })
+  }, [hoveredGrandchild])
 
   useEffect(() => {
     return () => {
@@ -470,13 +610,19 @@ function ReadOnlyJsonCardNodeComponent({
     event.stopPropagation()
     onSelect(row.path, path)
     setGotoOpen(false)
+    const linkedRow = containerRows.find(
+      (item) => item.linked && pathToId(item.path) === pathToId(row.path),
+    )
+    const rowCanGoto = linkedRow
+      ? rowNavTargets(linkedRow, cardValue, path).length > 0
+      : false
     setContextMenu({
       copyKey: row.copyKey,
-      copyValue: row.copyValue,
+      copyValue: rowCopyText(row, cardValue, path),
       mode: 'row',
       path: row.path,
       type: row.type,
-      ...menuPosition(event, hasParent ? 150 : 116),
+      ...menuPosition(event, (hasParent ? 150 : 116) + (rowCanGoto ? 36 : 0)),
     })
   }
 
@@ -487,7 +633,7 @@ function ReadOnlyJsonCardNodeComponent({
     setGotoOpen(false)
     setContextMenu({
       copyKey: title,
-      copyValue,
+      copyValue: stringifyJsonValue(cardValue),
       mode: 'card',
       path,
       type: kind,
@@ -501,6 +647,7 @@ function ReadOnlyJsonCardNodeComponent({
     setContextMenu(null)
     setGotoOpen(false)
     setHoveredChild(null)
+    setHoveredGrandchild(null)
   }
 
   const focusNavTarget = (targetPath: JsonPath) => {
@@ -508,6 +655,7 @@ function ReadOnlyJsonCardNodeComponent({
     setContextMenu(null)
     setGotoOpen(false)
     setHoveredChild(null)
+    setHoveredGrandchild(null)
   }
 
   const hoverChildTarget = (
@@ -516,13 +664,27 @@ function ReadOnlyJsonCardNodeComponent({
   ) => {
     clearGotoCloseTimer()
     hoveredChildRectRef.current = event.currentTarget.getBoundingClientRect()
+    setHoveredGrandchild(null)
     setHoveredChild(target)
   }
 
-  const copyContextItem = (kind: 'key' | 'value') => {
+  const hoverGrandchildTarget = (
+    target: NavTarget,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) => {
+    clearGotoCloseTimer()
+    hoveredGrandchildRectRef.current = event.currentTarget.getBoundingClientRect()
+    setHoveredGrandchild(target)
+  }
+
+  const copyContextItem = (kind: 'key' | 'value' | 'path') => {
     if (!contextMenu) return
     onCopy(
-      kind === 'key' ? contextMenu.copyKey : contextMenu.copyValue,
+      kind === 'key'
+        ? contextMenu.copyKey
+        : kind === 'path'
+          ? formatPath(contextMenu.path)
+          : contextMenu.copyValue,
       kind,
     )
     setContextMenu(null)
@@ -537,7 +699,7 @@ function ReadOnlyJsonCardNodeComponent({
     setContextMenu(null)
     setGotoOpen(false)
     setValueEditor({
-      draft: row.copyValue,
+      draft: rowCopyText(row, cardValue, path),
       error: null,
       keyLabel: row.copyKey,
       path: row.path,
@@ -553,7 +715,7 @@ function ReadOnlyJsonCardNodeComponent({
     openValueEditor(
       {
         copyKey: title,
-        copyValue,
+        copyValue: stringifyJsonValue(cardValue),
         path,
         type: kind,
       },
@@ -604,7 +766,7 @@ function ReadOnlyJsonCardNodeComponent({
   }
 
   const hoveredChildValue = hoveredChild
-    ? childValueFromCard(copyValue, path, hoveredChild.path)
+    ? childValueFromCard(cardValue, path, hoveredChild.path)
     : undefined
   const hoveredChildFields =
     hoveredChildValue === undefined ? [] : previewFields(hoveredChildValue)
@@ -623,6 +785,51 @@ function ReadOnlyJsonCardNodeComponent({
           ? `${hoveredChildTotal} items`
           : `${hoveredChildTotal} keys`
         : getValueType(hoveredChildValue)
+  const linkedContextRow =
+    contextMenu?.mode === 'row'
+      ? containerRows.find(
+          (row) =>
+            row.linked && pathToId(row.path) === pathToId(contextMenu.path),
+        )
+      : undefined
+  const rowGotoTargets = linkedContextRow
+    ? rowNavTargets(linkedContextRow, cardValue, path)
+    : []
+  const gotoTargets =
+    contextMenu?.mode === 'row' ? rowGotoTargets : childTargets
+  const showGoto = gotoTargets.length > 0
+  const grandchildTargets =
+    hoveredChild === null
+      ? []
+      : outgoingCardTargets(hoveredChildValue, hoveredChild.path).slice(
+          0,
+          GOTO_ITEM_LIMIT,
+        )
+  const hoveredGrandchildValue = hoveredGrandchild
+    ? childValueFromCard(cardValue, path, hoveredGrandchild.path)
+    : undefined
+  const hoveredGrandchildFields =
+    hoveredGrandchildValue === undefined
+      ? []
+      : previewFields(hoveredGrandchildValue)
+  const hoveredGrandchildTotal =
+    hoveredGrandchildValue !== undefined && isContainer(hoveredGrandchildValue)
+      ? Array.isArray(hoveredGrandchildValue)
+        ? hoveredGrandchildValue.length
+        : Object.keys(hoveredGrandchildValue).length
+      : hoveredGrandchildFields.length
+  const hoveredGrandchildHidden = Math.max(
+    0,
+    hoveredGrandchildTotal - hoveredGrandchildFields.length,
+  )
+  const hoveredGrandchildKind =
+    hoveredGrandchildValue === undefined
+      ? ''
+      : isContainer(hoveredGrandchildValue)
+        ? Array.isArray(hoveredGrandchildValue)
+          ? `${hoveredGrandchildTotal} items`
+          : `${hoveredGrandchildTotal} keys`
+        : getValueType(hoveredGrandchildValue)
 
   return (
     <>
@@ -632,7 +839,7 @@ function ReadOnlyJsonCardNodeComponent({
           selectionState === 'selected' ? 'is-selected' : ''
         } ${selectionState === 'dimmed' ? 'is-dimmed' : ''} ${
           relationHoverState === 'target' ? 'is-relation-target' : ''
-        }`}
+        } ${cardDiff ? `is-diff-${cardDiff}` : ''}`}
         ref={rootRef}
       >
       {!isRoot && (
@@ -680,7 +887,9 @@ function ReadOnlyJsonCardNodeComponent({
                 row.matched ? 'row-match' : ''
               } ${row.selected ? 'is-selected-row' : ''} ${
                 row.multiline ? 'is-multiline' : ''
-              } ${row.keyLabel ? '' : 'is-leaf-text'}`}
+              } ${row.keyLabel ? '' : 'is-leaf-text'} ${
+                row.diff ? `row-diff-${row.diff}` : ''
+              }`}
               key={`${row.path.join('.')}-primitive`}
               onClick={(event) => {
                 event.stopPropagation()
@@ -740,7 +949,7 @@ function ReadOnlyJsonCardNodeComponent({
                 pathToId(row.path) === hoveredSourcePathId
                   ? 'is-hovered-relation-row'
                   : ''
-              }`}
+              } ${row.diff ? `row-diff-${row.diff}` : ''}`}
               key={`${row.path.join('.')}-container`}
               onClick={(event) => {
                 event.stopPropagation()
@@ -862,6 +1071,9 @@ function ReadOnlyJsonCardNodeComponent({
                 <strong title={contextMenu.mode === 'card' ? title : contextMenu.copyKey}>
                   {contextMenu.mode === 'card' ? title : contextMenu.copyKey}
                 </strong>
+                <code title={formatPath(contextMenu.path)}>
+                  {formatPath(contextMenu.path)}
+                </code>
                 {contextMenu.mode === 'row' ? (
                   <span>{contextMenu.type}</span>
                 ) : null}
@@ -872,7 +1084,7 @@ function ReadOnlyJsonCardNodeComponent({
                   <span>定位到父节点</span>
                 </button>
               ) : null}
-              {contextMenu.mode === 'card' && canGoto ? (
+              {showGoto ? (
                 <div className={`context-goto ${gotoOpen ? 'is-open' : ''}`}>
                   <button
                     aria-expanded={gotoOpen}
@@ -891,6 +1103,15 @@ function ReadOnlyJsonCardNodeComponent({
                 </div>
               ) : null}
               {contextMenu.mode === 'card' ? (
+                <>
+                <button
+                  onClick={() => copyContextItem('path')}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Link2 size={13} />
+                  <span>复制路径</span>
+                </button>
                 <button
                   disabled={contextMenu.type === 'null'}
                   onClick={editContextValue}
@@ -900,6 +1121,7 @@ function ReadOnlyJsonCardNodeComponent({
                   <Pencil size={13} />
                   <span>编辑卡片</span>
                 </button>
+                </>
               ) : (
                 <>
                   <button
@@ -919,6 +1141,14 @@ function ReadOnlyJsonCardNodeComponent({
                     <span>复制 Key</span>
                   </button>
                   <button
+                    onClick={() => copyContextItem('path')}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <Link2 size={13} />
+                    <span>复制路径</span>
+                  </button>
+                  <button
                     disabled={contextMenu.type === 'null'}
                     onClick={editContextValue}
                     role="menuitem"
@@ -935,7 +1165,7 @@ function ReadOnlyJsonCardNodeComponent({
                 </>
               )}
             </div>
-            {gotoOpen && contextMenu.mode === 'card' ? (
+            {gotoOpen && showGoto ? (
               <div
                 className="json-row-context-menu context-goto-flyout"
                 onContextMenu={(event) => event.preventDefault()}
@@ -946,27 +1176,14 @@ function ReadOnlyJsonCardNodeComponent({
                 role="menu"
                 style={gotoMenuStyle}
               >
-                {primitiveRows.length > 0 ? (
-                  <div className="context-goto-props">
-                    {primitiveRows.map((row) => (
-                      <div className="context-goto-prop" key={pathToId(row.path)}>
-                        <span className="context-goto-prop-key">
-                          {row.keyLabel || title}
-                        </span>
-                        <span
-                          className={`context-goto-prop-value value-${row.type}`}
-                          title={previewPrimitive(row.value)}
-                        >
-                          {previewPrimitive(row.value)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {childTargets.length > 0 ? (
+                {gotoTargets.length > 0 ? (
                   <div className="context-goto-group">
-                    <span className="context-goto-label">Outgoing</span>
-                    {childTargets.map((target) => (
+                    <span className="context-goto-label">
+                      {contextMenu.mode === 'row' ? '子节点' : 'Outgoing'}
+                    </span>
+                    {gotoTargets.map((target) => {
+                      const hasGrandchildren = childHasGrandchildren(target)
+                      return (
                       <button
                         className={
                           hoveredChild &&
@@ -975,7 +1192,16 @@ function ReadOnlyJsonCardNodeComponent({
                             : undefined
                         }
                         key={`child-${pathToId(target.path)}`}
-                        onClick={() => focusNavTarget(target.path)}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          focusNavTarget(target.path)
+                        }}
+                        onPointerDown={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          focusNavTarget(target.path)
+                        }}
                         onMouseEnter={(event) => hoverChildTarget(target, event)}
                         role="menuitem"
                         title={target.label}
@@ -983,13 +1209,17 @@ function ReadOnlyJsonCardNodeComponent({
                       >
                         <CornerDownRight size={12} />
                         <span>{target.label}</span>
+                        {hasGrandchildren ? (
+                          <ChevronRight className="context-goto-chevron" size={12} />
+                        ) : null}
                       </button>
-                    ))}
+                      )
+                    })}
                   </div>
                 ) : null}
               </div>
             ) : null}
-            {gotoOpen && hoveredChild && contextMenu.mode === 'card' ? (
+            {gotoOpen && hoveredChild && showGoto ? (
               <div
                 className="json-row-context-menu context-goto-preview"
                 onContextMenu={(event) => event.preventDefault()}
@@ -1028,6 +1258,91 @@ function ReadOnlyJsonCardNodeComponent({
                     {hoveredChildHidden > 0 ? (
                       <div className="context-goto-preview-more">
                         还有 {hoveredChildHidden} 项
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+                {grandchildTargets.length > 0 ? (
+                  <div className="context-goto-group">
+                    <span className="context-goto-label">前往孙子节点</span>
+                    {grandchildTargets.map((target) => (
+                      <button
+                        className={
+                          hoveredGrandchild &&
+                          pathToId(hoveredGrandchild.path) ===
+                            pathToId(target.path)
+                            ? 'is-previewed'
+                            : undefined
+                        }
+                        key={`grand-${pathToId(target.path)}`}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          focusNavTarget(target.path)
+                        }}
+                        onPointerDown={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          focusNavTarget(target.path)
+                        }}
+                        onMouseEnter={(event) =>
+                          hoverGrandchildTarget(target, event)
+                        }
+                        role="menuitem"
+                        title={formatPath(target.path)}
+                        type="button"
+                      >
+                        <CornerDownRight size={12} />
+                        <span>{target.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {gotoOpen && hoveredGrandchild && showGoto ? (
+              <div
+                className="json-row-context-menu context-goto-preview is-grand"
+                onContextMenu={(event) => event.preventDefault()}
+                onMouseEnter={openGoto}
+                onMouseLeave={scheduleCloseGoto}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={grandchildPreviewRef}
+                style={grandchildPreviewStyle}
+              >
+                <div className="context-goto-preview-header">
+                  <strong title={hoveredGrandchild.label}>
+                    {hoveredGrandchild.label}
+                  </strong>
+                  {hoveredGrandchildKind ? (
+                    <span>{hoveredGrandchildKind}</span>
+                  ) : null}
+                </div>
+                {hoveredGrandchildFields.length === 0 ? (
+                  <div className="context-goto-preview-empty">暂无内容</div>
+                ) : (
+                  <div className="context-goto-props">
+                    {hoveredGrandchildFields.map((field, index) => (
+                      <div
+                        className="context-goto-prop"
+                        key={`${field.key}-${index}`}
+                      >
+                        {field.key ? (
+                          <span className="context-goto-prop-key">
+                            {field.key}
+                          </span>
+                        ) : null}
+                        <span
+                          className={`context-goto-prop-value value-${field.type}`}
+                          title={field.text}
+                        >
+                          {field.text}
+                        </span>
+                      </div>
+                    ))}
+                    {hoveredGrandchildHidden > 0 ? (
+                      <div className="context-goto-preview-more">
+                        还有 {hoveredGrandchildHidden} 项
                       </div>
                     ) : null}
                   </div>
