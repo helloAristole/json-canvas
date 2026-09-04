@@ -1010,6 +1010,8 @@ function DiagramCanvas({
             >
               <ImageDown size={13} strokeWidth={2.2} />
             </button>
+          </div>
+          <div className="canvas-toolbar">
             <Controls
               className="json-flow-controls"
               fitViewOptions={{ duration: 400, padding: 0.24, maxZoom: 1.15 }}

@@ -117,6 +117,20 @@ export function historyPreview(source: string): string {
   return compact.length <= 72 ? compact : `${compact.slice(0, 71)}…`
 }
 
+const MAX_HOVER_PREVIEW_CHARS = 6000
+
+export function formatHistoryHoverPreview(source: string): string {
+  const trimmed = source.trim() || '{}'
+  let text = trimmed
+  try {
+    text = JSON.stringify(JSON.parse(trimmed), null, 2)
+  } catch {
+    // Keep the raw snapshot when it is not valid JSON.
+  }
+  if (text.length <= MAX_HOVER_PREVIEW_CHARS) return text
+  return `${text.slice(0, MAX_HOVER_PREVIEW_CHARS)}\n…`
+}
+
 export function formatHistoryTime(savedAt: number, now = Date.now()): string {
   const delta = Math.max(0, now - savedAt)
   if (delta < 45_000) return '刚刚'

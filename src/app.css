@@ -405,8 +405,59 @@ select:focus-visible {
 }
 
 .history-entry:hover,
-.history-entry:focus-visible {
+.history-entry:focus-visible,
+.history-entry.is-previewed {
   background: var(--accent-soft);
+}
+
+.history-preview {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 16px));
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+}
+
+.history-preview > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-preview > header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-preview > header small {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.history-preview pre {
+  margin: 0;
+  padding: 8px 10px 10px;
+  overflow: auto;
+  color: var(--text-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .history-entry-meta {
@@ -2951,6 +3002,10 @@ select:focus-visible {
 .canvas-search-toggle:disabled {
   opacity: 0.45;
   cursor: wait;
+}
+
+.canvas-toolbar .canvas-search-toggle:last-child {
+  border-right: 0;
 }
 
 .json-flow-controls {

@@ -935,6 +935,12 @@ export default function App() {
     if (!historyOpen) return
     const closeOnPointerDown = (event: globalThis.PointerEvent) => {
       if (historyMenuRef.current?.contains(event.target as Node)) return
+      if (
+        event.target instanceof Element &&
+        event.target.closest('.history-preview')
+      ) {
+        return
+      }
       setHistoryOpen(false)
     }
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
@@ -1939,6 +1945,9 @@ export default function App() {
           >
             <Upload size={17} />
           </button>
+          <button className="toolbar-button" onClick={downloadFile} title="下载" type="button">
+            <Download size={17} />
+          </button>
           <button
             className="toolbar-button"
             onClick={() => void openFromClipboard()}
@@ -1947,9 +1956,7 @@ export default function App() {
           >
             <ClipboardPaste size={17} />
           </button>
-          <button className="toolbar-button" onClick={downloadFile} title="下载" type="button">
-            <Download size={17} />
-          </button>
+          <span className="toolbar-divider" />
           <div className="history-menu" ref={historyMenuRef}>
             <button
               aria-expanded={historyOpen}
