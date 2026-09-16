@@ -369,7 +369,10 @@ export function buildGraph(
           : Object.keys(child).length > 0
         containerRows.push({
           keyLabel: keyLabel(key, false),
-          copyKey: copyKeyForPath(childPath, String(key)),
+          copyKey:
+            typeof key === 'number'
+              ? `[${key}]`
+              : copyKeyForPath(childPath, String(key)),
           copyValue: '',
           order,
           path: childPath,
@@ -388,7 +391,10 @@ export function buildGraph(
       } else {
         primitiveRows.push({
           keyLabel: isLeafPrimitive ? '' : keyLabel(key, isRootPrimitive),
-          copyKey: copyKeyForPath(childPath, String(key)),
+          copyKey:
+            typeof key === 'number'
+              ? `[${key}]`
+              : copyKeyForPath(childPath, String(key)),
           copyValue: primitiveCopyValue(child),
           order,
           path: childPath,

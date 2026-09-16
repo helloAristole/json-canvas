@@ -935,12 +935,6 @@ export default function App() {
     if (!historyOpen) return
     const closeOnPointerDown = (event: globalThis.PointerEvent) => {
       if (historyMenuRef.current?.contains(event.target as Node)) return
-      if (
-        event.target instanceof Element &&
-        event.target.closest('.history-preview')
-      ) {
-        return
-      }
       setHistoryOpen(false)
     }
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {

@@ -273,17 +273,13 @@ function parseEditedValue(
   draft: string,
   type: JsonValueType,
 ): { error: string | null; value?: JsonValue } {
-  if (type === 'string') return { error: null, value: draft }
-  if (type === 'null') return { error: null, value: null }
+  if (type === 'string') {
+    if (draft.trim() === 'null') return { error: null, value: null }
+    return { error: null, value: draft }
+  }
 
   try {
-    const value = JSON.parse(draft) as JsonValue
-    const valueType =
-      value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
-    if (valueType !== type) {
-      return { error: `请输入 ${type} 类型的值` }
-    }
-    return { error: null, value }
+    return { error: null, value: JSON.parse(draft) as JsonValue }
   } catch {
     return {
       error: type === 'object' || type === 'array' ? 'JSON 格式不正确' : 'Value 格式不正确',
@@ -331,7 +327,7 @@ function StaticValue({
         swatch ? 'has-color-swatch' : ''
       } ${multiline ? 'is-multiline nowheel nopan' : ''}`}
       onDoubleClick={onDoubleClick}
-      title={type === 'null' ? text : `${text}\n双击编辑`}
+      title={`${text}\n双击编辑`}
     >
       {swatch ? (
         <span
@@ -578,7 +574,9 @@ function ReadOnlyJsonCardNodeComponent({
   }, [valueEditor])
 
   const isJsonDraft =
-    valueEditor?.type === 'object' || valueEditor?.type === 'array'
+    valueEditor?.type === 'object' ||
+    valueEditor?.type === 'array' ||
+    valueEditor?.type === 'null'
 
   useLayoutEffect(() => {
     const textarea = valueEditorInputRef.current
@@ -695,7 +693,6 @@ function ReadOnlyJsonCardNodeComponent({
     row: CopyableRow,
     scope: 'card' | 'value' = 'value',
   ) => {
-    if (row.type === 'null') return
     setContextMenu(null)
     setGotoOpen(false)
     setValueEditor({
@@ -1113,7 +1110,6 @@ function ReadOnlyJsonCardNodeComponent({
                   <span>复制路径</span>
                 </button>
                 <button
-                  disabled={contextMenu.type === 'null'}
                   onClick={editContextValue}
                   role="menuitem"
                   type="button"
@@ -1149,14 +1145,8 @@ function ReadOnlyJsonCardNodeComponent({
                     <span>复制路径</span>
                   </button>
                   <button
-                    disabled={contextMenu.type === 'null'}
                     onClick={editContextValue}
                     role="menuitem"
-                    title={
-                      contextMenu.type === 'null'
-                        ? 'null 类型没有可编辑内容'
-                        : undefined
-                    }
                     type="button"
                   >
                     <Pencil size={13} />

@@ -324,8 +324,7 @@ select:focus-visible {
   display: flex;
   flex-direction: column;
   width: min(340px, calc(100vw - 16px));
-  max-height: min(420px, calc(100vh - 48px));
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel);
@@ -380,6 +379,7 @@ select:focus-visible {
 .history-panel ul {
   margin: 0;
   padding: 6px;
+  max-height: min(360px, calc(100vh - 88px));
   overflow: auto;
   list-style: none;
 }
@@ -411,16 +411,28 @@ select:focus-visible {
 }
 
 .history-preview {
-  position: fixed;
+  position: absolute;
   z-index: 90;
   display: flex;
   flex-direction: column;
-  width: min(360px, calc(100vw - 16px));
+  top: calc(100% + 6px);
+  right: 0;
+  width: 100%;
+  max-height: 240px;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel);
   box-shadow: var(--shadow-md);
+}
+
+@media (min-width: 800px) {
+  .history-preview {
+    top: 0;
+    right: calc(100% + 8px);
+    width: 360px;
+    max-height: 100%;
+  }
 }
 
 .history-preview > header {
@@ -458,6 +470,58 @@ select:focus-visible {
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+  user-select: text;
+  cursor: text;
+}
+
+.history-panel .json-hl-key {
+  color: #287b9b;
+  font-weight: 600;
+}
+
+.history-panel .json-hl-string {
+  color: #aa3f49;
+}
+
+.history-panel .json-hl-number {
+  color: #16845b;
+}
+
+.history-panel .json-hl-bool {
+  color: #7257f6;
+}
+
+.history-panel .json-hl-null {
+  color: #858b98;
+  font-style: italic;
+}
+
+.history-panel .json-hl-punct {
+  color: #656c79;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-key {
+  color: #7dcfff;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-string {
+  color: #e0af68;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-number {
+  color: #9ece6a;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-bool {
+  color: #bb9af7;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-null {
+  color: #7a849e;
+}
+
+:root[data-theme='dark'] .history-panel .json-hl-punct {
+  color: #6d768a;
 }
 
 .history-entry-meta {
