@@ -76,5 +76,6 @@ npm run preview # 本地预览构建产物
 
 ## 部署
 
-- **EdgeOne Makers（正式）**：<https://json.nuaapicture.cloud/>
+- **GitHub Pages**：<https://helloaristole.github.io/json-canvas/>
+- **EdgeOne Makers**：<https://json.nuaapicture.cloud/>
 - **AnyDev 内网预览**：<https://ortonzhu-any3.devcloud.woa.com/json>
